@@ -1,58 +1,90 @@
 import os
 import time
+import json
+import gzip
 import threading
 import requests
 import pandas as pd
+
 from flask import Flask
 
 
 app = Flask(__name__)
 
 
-API_KEY = os.getenv("UPSTOX_API_KEY")
+# =========================
+# UPSTOX SETTINGS
+# =========================
+
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 
 
+BASE = "https://api.upstox.com"
+
+INSTR_URL = (
+    "https://assets.upstox.com/"
+    "market-quote/instruments/exchange/"
+    "complete.json.gz"
+)
+
+
 headers = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "Authorization": f"Bearer {ACCESS_TOKEN}"
 }
 
 
 stocks = []
 
 
+# =========================
+# LOAD NSE EQUITY
+# =========================
+
 def load_nse_stocks():
 
     global stocks
 
+
     try:
 
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv"
-response = requests.get(url, headers={"User-Agent":"Mozilla/5.0"})
-response.raise_for_status()
-
-from io import StringIO
-df = pd.read_csv(StringIO(response.text))
-
-        
+        r = requests.get(
+            INSTR_URL,
+            timeout=30
+        )
 
 
-        df = df[
-            (df["segment"] == "NSE_EQ")
-            &
-            (df["instrument_type"] == "EQ")
+        r.raise_for_status()
+
+
+        raw = r.content
+
+
+        if raw[:2] == b"\x1f\x8b":
+
+            raw = gzip.decompress(raw)
+
+
+        data = json.loads(
+            raw.decode("utf-8")
+        )
+
+
+        stocks = [
+
+            {
+                "name": x.get("trading_symbol"),
+                "key": x.get("instrument_key")
+            }
+
+            for x in data
+
+            if x.get("segment") == "NSE_EQ"
+            and x.get("instrument_type") == "EQ"
+            and x.get("security_type") == "NORMAL"
+            and x.get("instrument_key")
+
         ]
-
-
-        for _, row in df.iterrows():
-
-            stocks.append(
-                {
-                    "name": row["trading_symbol"],
-                    "key": row["instrument_key"]
-                }
-            )
 
 
         print(
@@ -63,6 +95,7 @@ df = pd.read_csv(StringIO(response.text))
 
     except Exception as e:
 
+
         print(
             "Stock loading error:",
             e
@@ -70,12 +103,17 @@ df = pd.read_csv(StringIO(response.text))
 
 
 
+# =========================
+# GET 5 MINUTE CANDLE
+# =========================
+
 def get_candle(instrument_key):
 
 
     url = (
-        "https://api.upstox.com/v3/historical-candle/"
-        f"intraday/{instrument_key}/5minute"
+        BASE
+        + "/v3/historical-candle/"
+        + f"intraday/{instrument_key}/5minute"
     )
 
 
@@ -93,9 +131,7 @@ def get_candle(instrument_key):
             return None
 
 
-
         candles = r.json()["data"]["candles"]
-
 
 
         df = pd.DataFrame(
@@ -115,12 +151,15 @@ def get_candle(instrument_key):
         return df
 
 
-
     except Exception:
 
 
         return None
-        results = []
+# =========================         
+# SCANNER LOGIC
+# =========================
+
+results = []
 
 
 def scan_market():
@@ -130,13 +169,16 @@ def scan_market():
 
     while True:
 
+
         temp = []
 
 
         for stock in stocks:
 
 
-            df = get_candle(stock["key"])
+            df = get_candle(
+                stock["key"]
+            )
 
 
             if df is None:
@@ -148,21 +190,27 @@ def scan_market():
 
 
 
-            # Last completed 5 minute candle
-
-            current = df.iloc[1]
-
-            previous = df.iloc[2]
-
-
-
             try:
 
 
-                price = float(current["close"])
+                # Latest completed candle
+
+                current = df.iloc[1]
 
 
-                # Price above 50
+                # Previous completed candle
+
+                previous = df.iloc[2]
+
+
+
+                price = float(
+                    current["close"]
+                )
+
+
+
+                # Price filter
 
                 if price < 50:
                     continue
@@ -172,8 +220,11 @@ def scan_market():
                 # Previous candle green
 
                 previous_green = (
-                    previous["close"] >
+
+                    previous["close"]
+                    >
                     previous["open"]
+
                 )
 
 
@@ -181,25 +232,35 @@ def scan_market():
                 # Current candle red
 
                 current_red = (
-                    current["close"] <
+
+                    current["close"]
+                    <
                     current["open"]
+
                 )
 
 
 
-                # Current volume greater than previous
+                # Volume jump
 
                 volume_jump = (
-                    current["volume"] >
+
+                    current["volume"]
+                    >
                     previous["volume"]
+
                 )
 
 
 
                 if (
+
                     previous_green
-                    and current_red
-                    and volume_jump
+                    and
+                    current_red
+                    and
+                    volume_jump
+
                 ):
 
 
@@ -213,20 +274,28 @@ def scan_market():
                             )
                             /
                             current["open"]
+
                         )
                         * 100
 
                     )
 
 
-
                     temp.append(
 
                         {
-                            "name": stock["name"],
-                            "price": round(price,2),
-                            "volume": int(current["volume"]),
-                            "percent": round(percent,2)
+                            "name":
+                                stock["name"],
+
+                            "price":
+                                round(price, 2),
+
+                            "volume":
+                                int(current["volume"]),
+
+                            "percent":
+                                round(percent, 2)
+
                         }
 
                     )
@@ -238,14 +307,23 @@ def scan_market():
 
 
 
+
         results = sorted(
 
             temp,
 
-            key=lambda x:x["percent"],
+            key=lambda x:
+                x["percent"],
 
             reverse=True
 
+        )
+
+
+
+        print(
+            "Signals:",
+            len(results)
         )
 
 
@@ -253,6 +331,10 @@ def scan_market():
 
 
 
+
+# =========================
+# WEB PAGE
+# =========================
 
 @app.route("/")
 def home():
@@ -264,7 +346,9 @@ def home():
 
     <head>
 
-    <title>RedVol5M Scanner</title>
+    <title>
+    RedVol5M Scanner
+    </title>
 
     </head>
 
@@ -272,23 +356,25 @@ def home():
     <body>
 
 
-    <h1>RedVol5M Scanner</h1>
+    <h1>
+    RedVol5M Scanner
+    </h1>
 
 
     <h3>
-
     Completed 5 Minute Candle Signal
-
     </h3>
 
     """
 
 
 
-    if len(results) == 0:
+    if not results:
 
 
-        html += "<h2>No Signal Found</h2>"
+        html += (
+            "<h2>No Signal Found</h2>"
+        )
 
 
 
@@ -297,17 +383,16 @@ def home():
 
         html += """
 
-        <table border="1" cellpadding="8">
+        <table border="1"
+        cellpadding="8">
+
 
         <tr>
 
         <th>Stock</th>
-
         <th>Price</th>
-
         <th>Volume</th>
-
-        <th>Red Candle %</th>
+        <th>%</th>
 
         </tr>
 
@@ -340,7 +425,13 @@ def home():
 
 
 
-    html += "</body></html>"
+    html += """
+
+    </body>
+
+    </html>
+
+    """
 
 
     return html
@@ -348,11 +439,14 @@ def home():
 
 
 
+# =========================
+# START
+# =========================
+
 if __name__ == "__main__":
 
 
     load_nse_stocks()
-
 
 
     thread = threading.Thread(
