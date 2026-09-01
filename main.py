@@ -29,9 +29,13 @@ def load_nse_stocks():
     try:
 
         url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv"
+response = requests.get(url, headers={"User-Agent":"Mozilla/5.0"})
+response.raise_for_status()
 
+from io import StringIO
+df = pd.read_csv(StringIO(response.text))
 
-        df = pd.read_csv(url)
+        
 
 
         df = df[
