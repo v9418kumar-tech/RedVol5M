@@ -270,15 +270,34 @@ def scan_market():
                         /
                         float(previous["volume"])
 
-                    )
+      if not results:
 
+    html += """
 
-                    temp.append(
+    <table border="1" cellpadding="8">
 
-                        {
+    <tr>
+    <th>Rank</th>
+    <th>Symbol</th>
+    <th>Price</th>
+    <th>Volume</th>
+    <th>Previous Volume</th>
+    <th>Jump</th>
+    <th>Time</th>
+    </tr>
 
-                            "symbol":
-                                stock["name"],
+    <tr>
+    <td colspan="7" align="center">
+    No Signal Found
+    </td>
+    </tr>
+
+    </table>
+
+    """              
+
+                            
+                                
 
 
                             "price":
@@ -370,12 +389,7 @@ def home():
 
 
 
-    if not results:
-
-
-        html += (
-            "<h2>No Signal Found</h2>"
-        )
+    
 
 
 
