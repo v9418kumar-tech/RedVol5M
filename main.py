@@ -1,13 +1,16 @@
+import os
+import time
+import threading
 import requests
 import pandas as pd
-import time
 from datetime import datetime
 from flask import Flask
 
 app = Flask(__name__)
 
-# Upstox Access Token यहां डालना है
-ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+
+# Upstox token Render Environment से आएगा
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 
 headers = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -15,30 +18,40 @@ headers = {
 }
 
 
-symbols = [
-    "NSE_EQ|INE123A01016",
-    "NSE_EQ|INE002A01018",
+# यहां NSE Equity instrument keys डालेंगे
+stocks = [
+    {
+        "name": "STOCK1",
+        "key": "NSE_EQ|XXXXXXXXXXXX"
+    },
+    {
+        "name": "STOCK2",
+        "key": "NSE_EQ|XXXXXXXXXXXX"
+    }
 ]
 
 
-def get_candle(symbol):
+latest_result = []
+
+
+def get_5min_candle(stock_key):
 
     url = (
         "https://api.upstox.com/v3/historical-candle/"
-        f"intraday/{symbol}/5minute"
+        f"intraday/{stock_key}/5minute"
     )
 
     try:
-        response = requests.get(
+        r = requests.get(
             url,
             headers=headers,
             timeout=10
         )
 
-        if response.status_code != 200:
+        if r.status_code != 200:
             return None
 
-        candles = response.json()["data"]["candles"]
+        candles = r.json()["data"]["candles"]
 
         df = pd.DataFrame(
             candles,
@@ -60,104 +73,149 @@ def get_candle(symbol):
 
 
 
-def scan():
+def scan_market():
 
-    results = []
+    global latest_result
 
-    for symbol in symbols:
+    result = []
 
-        df = get_candle(symbol)
+
+    for stock in stocks:
+
+        df = get_5min_candle(stock["key"])
 
         if df is None or len(df) < 2:
             continue
 
 
+        # latest completed candle
         current = df.iloc[0]
+
+        # previous candle
         previous = df.iloc[1]
 
 
+        price = float(current["close"])
+
+
         # Price >= 50
-        if float(current["close"]) < 50:
+        if price < 50:
             continue
 
 
-        # पिछली candle Green
+        # Previous Green candle
         previous_green = (
             previous["close"] > previous["open"]
         )
 
 
-        # Current candle Red
+        # Current Red candle
         current_red = (
             current["close"] < current["open"]
         )
 
 
-        # Current red candle volume > previous green candle volume
-        volume_high = (
+        # Red candle volume > Green candle volume
+        volume_condition = (
             current["volume"] >
             previous["volume"]
         )
 
 
-        if previous_green and current_red and volume_high:
+        if (
+            previous_green
+            and current_red
+            and volume_condition
+        ):
 
-            percent = (
-                (current["close"] -
-                 previous["close"])
+            percentage = (
+                (price - float(previous["close"]))
                 /
-                previous["close"]
+                float(previous["close"])
             ) * 100
 
 
-            results.append({
-                "Symbol": symbol,
-                "Price": round(float(current["close"]),2),
-                "Percentage": round(percent,2),
-                "Volume": int(current["volume"])
-            })
+            result.append(
+                {
+                    "Symbol": stock["name"],
+                    "Price": round(price,2),
+                    "Percentage": round(percentage,2),
+                    "Volume": int(current["volume"]),
+                    "Time": current["time"]
+                }
+            )
 
 
-    results.sort(
+    # High percentage first
+    result.sort(
         key=lambda x:x["Percentage"],
         reverse=True
     )
 
 
-    print("\nRedVol5M Scanner")
+    latest_result = result
+
+
     print(datetime.now())
+    print(result)
 
-    for r in results:
-        print(r)
 
-    if not results:
-        print("No Signal Found")
+
+def background():
+
+    while True:
+
+        scan_market()
+
+        # हर 5 मिनट
+        time.sleep(300)
 
 
 
 @app.route("/")
 def home():
-    return "RedVol5M Scanner Running"
+
+    html = """
+    <h2>RedVol5M Scanner</h2>
+    <p>Only Completed 5 Minute Candle Signals</p>
+    """
+
+    if latest_result:
+
+        html += "<table border='1'>"
+        html += "<tr><th>Symbol</th><th>Price</th><th>%</th><th>Volume</th></tr>"
+
+        for x in latest_result:
+
+            html += f"""
+            <tr>
+            <td>{x['Symbol']}</td>
+            <td>{x['Price']}</td>
+            <td>{x['Percentage']}%</td>
+            <td>{x['Volume']}</td>
+            </tr>
+            """
+
+        html += "</table>"
+
+    else:
+
+        html += "<h3>No Signal Found</h3>"
 
 
-
-def run_scanner():
-
-    while True:
-        scan()
-        time.sleep(300)   # 5 minute
+    return html
 
 
 
 if __name__ == "__main__":
 
-    import threading
-
     t = threading.Thread(
-        target=run_scanner
+        target=background
     )
 
+    t.daemon = True
     t.start()
+
 
     app.run(
         host="0.0.0.0",
