@@ -55,11 +55,8 @@ def load_nse_stocks():
 
         raw = r.content
 
-
         if raw[:2] == b"\x1f\x8b":
-
             raw = gzip.decompress(raw)
-
 
         data = json.loads(
             raw.decode("utf-8")
@@ -71,7 +68,6 @@ def load_nse_stocks():
 
         for x in data:
 
-
             if (
                 x.get("segment") == "NSE_EQ"
                 and x.get("instrument_type") == "EQ"
@@ -81,11 +77,8 @@ def load_nse_stocks():
 
                 stocks.append(
                     {
-                        "name":
-                            x.get("trading_symbol"),
-
-                        "key":
-                            x.get("instrument_key")
+                        "name": x.get("trading_symbol"),
+                        "key": x.get("instrument_key")
                     }
                 )
 
@@ -103,14 +96,11 @@ def load_nse_stocks():
             e
         )
 
-
-
 # =========================
 # GET 5 MINUTE CANDLE
 # =========================
 
 def get_candle(instrument_key):
-
 
     url = (
         BASE
@@ -156,7 +146,10 @@ def get_candle(instrument_key):
     except Exception:
 
         return None
-# =========================        
+
+
+
+# =========================
 # SCANNER
 # =========================
 
@@ -189,19 +182,11 @@ def scan_market():
                 continue
 
 
-
             try:
-
-
-                # Last completed 5 minute candle
 
                 current = df.iloc[1]
 
-
-                # Previous completed candle
-
                 previous = df.iloc[2]
-
 
 
                 price = float(
@@ -209,158 +194,68 @@ def scan_market():
                 )
 
 
-
-                # Price filter
-
                 if price < 50:
                     continue
 
 
-
-                # Previous green candle
-
                 previous_green = (
-
                     previous["close"]
                     >
                     previous["open"]
-
                 )
 
 
-
-                # Current red candle
-
                 current_red = (
-
                     current["close"]
                     <
                     current["open"]
-
                 )
 
 
-
-                # Current volume greater
-
                 volume_jump = (
-
                     current["volume"]
                     >
                     previous["volume"]
-
                 )
 
 
-
                 if (
-
                     previous_green
                     and
                     current_red
                     and
                     volume_jump
-
                 ):
 
 
                     multiplier = (
-
                         float(current["volume"])
                         /
                         float(previous["volume"])
-)
-      if not results:
-
-    html += """
-
-    <table border="1" cellpadding="8">
-
-    <tr>
-    <th>Rank</th>
-    <th>Symbol</th>
-    <th>Price</th>
-    <th>Volume</th>
-    <th>Previous Volume</th>
-    <th>Jump</th>
-    <th>Time</th>
-    </tr>
-
-    <tr>
-    <td colspan="7" align="center">
-    No Signal Found
-    </td>
-    </tr>
-
-    </table>
-
-    """              
-
-                            
-                                
+                    )
 
 
-                            "price":
-                                round(price,2),
-
-
-                            "volume":
-                                int(current["volume"]),
-
-
-                            "avg5":
-                                int(previous["volume"]),
-
-
-                            "multiplier":
-                                round(multiplier,2),
-
-
-                            "time":
-                                current["time"]
-
+                    temp.append(
+                        {
+                            "symbol": stock["name"],
+                            "price": round(price,2),
+                            "volume": int(current["volume"]),
+                            "avg5": int(previous["volume"]),
+                            "multiplier": round(multiplier,2),
+                            "time": current["time"]
                         }
-
                     )
 
 
             except Exception:
 
                 continue
-
-
-
-        results = sorted(
-
-            temp,
-
-            key=lambda x:
-                x["multiplier"],
-
-            reverse=True
-
-        )
-
-
-        print(
-            "Signals:",
-            len(results)
-        )
-
-
-        time.sleep(300)
-
-
-
-
-
-# =========================
+# ========================= 
 # WEB PAGE
 # =========================
 
 @app.route("/")
 def home():
-
 
     html = """
 
@@ -368,7 +263,7 @@ def home():
 
     <head>
 
-    <title>ParulScanner 5M</title>
+    <title>RedVol5M Scanner</title>
 
     </head>
 
@@ -377,33 +272,24 @@ def home():
 
 
     <h1>
-    ParulScanner
+    RedVol5M Scanner
     </h1>
 
 
     <h3>
-    5-Minute Red Volume Signal Scanner
+    5 Minute Volume Signal
     </h3>
 
     """
 
 
-
-    
-
-
-
-    else:
+    if not results:
 
 
         html += """
-
-        <table border="1"
-        cellpadding="8">
-
+        <table border="1" cellpadding="8">
 
         <tr>
-
         <th>Rank</th>
         <th>Symbol</th>
         <th>Price</th>
@@ -411,32 +297,50 @@ def home():
         <th>Previous Volume</th>
         <th>Jump</th>
         <th>Time</th>
+        </tr>
 
+        <tr>
+        <td colspan="7" align="center">
+        No Signal Found
+        </td>
+        </tr>
+
+        </table>
+        """
+
+
+    else:
+
+
+        html += """
+
+        <table border="1" cellpadding="8">
+
+        <tr>
+        <th>Rank</th>
+        <th>Symbol</th>
+        <th>Price</th>
+        <th>Volume</th>
+        <th>Previous Volume</th>
+        <th>Jump</th>
+        <th>Time</th>
         </tr>
 
         """
 
 
-
         for i,r in enumerate(results,1):
-
 
             html += f"""
 
             <tr>
 
             <td>{i}</td>
-
             <td>{r['symbol']}</td>
-
-            <td>₹{r['price']}</td>
-
+            <td>{r['price']}</td>
             <td>{r['volume']}</td>
-
             <td>{r['avg5']}</td>
-
             <td>{r['multiplier']}x</td>
-
             <td>{r['time']}</td>
 
             </tr>
@@ -444,9 +348,7 @@ def home():
             """
 
 
-
         html += "</table>"
-
 
 
     html += """
@@ -462,8 +364,6 @@ def home():
 
 
 
-
-
 # =========================
 # START SERVER
 # =========================
@@ -475,22 +375,18 @@ if __name__ == "__main__":
 
 
     thread = threading.Thread(
-
         target=scan_market,
-
         daemon=True
-
     )
 
 
     thread.start()
 
 
-
     app.run(
-
         host="0.0.0.0",
-
         port=10000
-
     )
+
+
+
