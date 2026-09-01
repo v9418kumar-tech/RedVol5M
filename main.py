@@ -269,7 +269,7 @@ def scan_market():
                         float(current["volume"])
                         /
                         float(previous["volume"])
-
+)
       if not results:
 
     html += """
