@@ -2,11 +2,12 @@ import requests
 import pandas as pd
 import time
 from datetime import datetime
+from flask import Flask
 
+app = Flask(__name__)
 
 # Upstox Access Token यहां डालना है
 ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
-
 
 headers = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -14,7 +15,6 @@ headers = {
 }
 
 
-# बाद में पूरी NSE equity list जोड़ेंगे
 symbols = [
     "NSE_EQ|INE123A01016",
     "NSE_EQ|INE002A01018",
@@ -38,9 +38,7 @@ def get_candle(symbol):
         if response.status_code != 200:
             return None
 
-        data = response.json()
-
-        candles = data["data"]["candles"]
+        candles = response.json()["data"]["candles"]
 
         df = pd.DataFrame(
             candles,
@@ -74,63 +72,54 @@ def scan():
             continue
 
 
-        # Latest completed 5 minute candle
         current = df.iloc[0]
-
-        # Previous candle
         previous = df.iloc[1]
 
 
-        price = float(current["close"])
-
-
-        # Price filter
-        if price < 50:
+        # Price >= 50
+        if float(current["close"]) < 50:
             continue
 
 
-        # Previous candle green
+        # पिछली candle Green
         previous_green = (
             previous["close"] > previous["open"]
         )
 
 
-        # Current candle red
+        # Current candle Red
         current_red = (
             current["close"] < current["open"]
         )
 
 
-        # Current red candle volume higher than previous green
-        volume_condition = (
+        # Current red candle volume > previous green candle volume
+        volume_high = (
             current["volume"] >
             previous["volume"]
         )
 
 
-        if previous_green and current_red and volume_condition:
+        if previous_green and current_red and volume_high:
 
-
-            percentage = (
-                (price - float(previous["close"]))
+            percent = (
+                (current["close"] -
+                 previous["close"])
                 /
-                float(previous["close"])
+                previous["close"]
             ) * 100
 
 
-            results.append(
-                {
-                    "Symbol": symbol,
-                    "Price": round(price, 2),
-                    "Percentage": round(percentage, 2),
-                    "Volume": int(current["volume"])
-                }
-            )
+            results.append({
+                "Symbol": symbol,
+                "Price": round(float(current["close"]),2),
+                "Percentage": round(percent,2),
+                "Volume": int(current["volume"])
+            })
 
 
-    # Highest percentage first
     results.sort(
-        key=lambda x: x["Percentage"],
+        key=lambda x:x["Percentage"],
         reverse=True
     )
 
@@ -138,23 +127,39 @@ def scan():
     print("\nRedVol5M Scanner")
     print(datetime.now())
 
+    for r in results:
+        print(r)
 
-    if len(results) == 0:
-
+    if not results:
         print("No Signal Found")
 
-    else:
-
-        for r in results:
-            print(r)
 
 
+@app.route("/")
+def home():
+    return "RedVol5M Scanner Running"
 
-# Render continuous running
-if __name__ == "__main__":
+
+
+def run_scanner():
 
     while True:
-
         scan()
+        time.sleep(300)   # 5 minute
 
-        time.sleep(300)
+
+
+if __name__ == "__main__":
+
+    import threading
+
+    t = threading.Thread(
+        target=run_scanner
+    )
+
+    t.start()
+
+    app.run(
+        host="0.0.0.0",
+        port=10000
+    )
