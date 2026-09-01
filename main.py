@@ -1,9 +1,10 @@
 import requests
 import pandas as pd
+import time
 from datetime import datetime
 
 
-# अपना Upstox Access Token यहां डालना है
+# Upstox Access Token यहां डालना है
 ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
 
@@ -13,7 +14,7 @@ headers = {
 }
 
 
-# बाद में यहां अपनी पूरी equity list जोड़ सकते हैं
+# बाद में पूरी NSE equity list जोड़ेंगे
 symbols = [
     "NSE_EQ|INE123A01016",
     "NSE_EQ|INE002A01018",
@@ -30,13 +31,16 @@ def get_candle(symbol):
     try:
         response = requests.get(
             url,
-            headers=headers
+            headers=headers,
+            timeout=10
         )
 
         if response.status_code != 200:
             return None
 
-        candles = response.json()["data"]["candles"]
+        data = response.json()
+
+        candles = data["data"]["candles"]
 
         df = pd.DataFrame(
             candles,
@@ -70,49 +74,54 @@ def scan():
             continue
 
 
-        # Latest completed candle
+        # Latest completed 5 minute candle
         current = df.iloc[0]
 
         # Previous candle
         previous = df.iloc[1]
 
 
+        price = float(current["close"])
+
+
         # Price filter
-        if float(current["close"]) < 50:
+        if price < 50:
             continue
 
 
-        # Previous Green candle
+        # Previous candle green
         previous_green = (
             previous["close"] > previous["open"]
         )
 
 
-        # Current Red candle
+        # Current candle red
         current_red = (
             current["close"] < current["open"]
         )
 
 
-        # Volume condition
-        volume_high = (
+        # Current red candle volume higher than previous green
+        volume_condition = (
             current["volume"] >
             previous["volume"]
         )
 
 
-        if previous_green and current_red and volume_high:
+        if previous_green and current_red and volume_condition:
+
 
             percentage = (
-                (current["close"] - previous["close"])
-                / previous["close"]
+                (price - float(previous["close"]))
+                /
+                float(previous["close"])
             ) * 100
 
 
             results.append(
                 {
                     "Symbol": symbol,
-                    "Price": round(float(current["close"]), 2),
+                    "Price": round(price, 2),
                     "Percentage": round(percentage, 2),
                     "Volume": int(current["volume"])
                 }
@@ -126,16 +135,26 @@ def scan():
     )
 
 
-    print("RedVol5M Scanner")
+    print("\nRedVol5M Scanner")
     print(datetime.now())
 
-    if not results:
+
+    if len(results) == 0:
+
         print("No Signal Found")
 
     else:
-        for item in results:
-            print(item)
+
+        for r in results:
+            print(r)
 
 
 
-scan()
+# Render continuous running
+if __name__ == "__main__":
+
+    while True:
+
+        scan()
+
+        time.sleep(300)
