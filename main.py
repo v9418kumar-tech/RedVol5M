@@ -212,11 +212,13 @@ def scan_market():
                 )
 
 
-                volume_jump = (
-                    current["volume"]
-                    >
-                    previous["volume"]
-                )
+                jump = (
+
+    int(current["volume"])
+    -
+    int(previous["volume"])
+
+)
 
 
                 if (
@@ -224,15 +226,15 @@ def scan_market():
                     and
                     current_red
                     and
-                    volume_jump
+                    current["volume"] > previous["volume"]
                 ):
 
 
-                    multiplier = (
-                        float(current["volume"])
-                        /
-                        float(previous["volume"])
-                    )
+                    jump = (
+    int(current["volume"])
+    -
+    int(previous["volume"])
+)
 
 
                     temp.append(
@@ -241,7 +243,7 @@ def scan_market():
                             "price": round(price,2),
                             "volume": int(current["volume"]),
                             "avg5": int(previous["volume"]),
-                            "multiplier": round(multiplier,2),
+                            "jump": jump,
                             "time": current["time"]
                         }
                     )
@@ -340,7 +342,7 @@ def home():
             <td>{r['price']}</td>
             <td>{r['volume']}</td>
             <td>{r['avg5']}</td>
-            <td>{r['multiplier']}x</td>
+            <td>{r['jump']}</td>
             <td>{r['time']}</td>
 
             </tr>
