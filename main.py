@@ -5,6 +5,7 @@ import requests
 import pandas as pd
 from flask import Flask
 
+
 app = Flask(__name__)
 
 
@@ -27,29 +28,27 @@ def load_nse_stocks():
 
     try:
 
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json"
-
-        r = requests.get(
-            url,
-            timeout=20
-        )
-
-        data = r.json()
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv"
 
 
-        for item in data:
+        df = pd.read_csv(url)
 
-            if (
-                item.get("segment") == "NSE_EQ"
-                and item.get("instrument_type") == "EQ"
-            ):
 
-                stocks.append(
-                    {
-                        "name": item["trading_symbol"],
-                        "key": item["instrument_key"]
-                    }
-                )
+        df = df[
+            (df["segment"] == "NSE_EQ")
+            &
+            (df["instrument_type"] == "EQ")
+        ]
+
+
+        for _, row in df.iterrows():
+
+            stocks.append(
+                {
+                    "name": row["trading_symbol"],
+                    "key": row["instrument_key"]
+                }
+            )
 
 
         print(
@@ -69,6 +68,7 @@ def load_nse_stocks():
 
 def get_candle(instrument_key):
 
+
     url = (
         "https://api.upstox.com/v3/historical-candle/"
         f"intraday/{instrument_key}/5minute"
@@ -85,10 +85,13 @@ def get_candle(instrument_key):
 
 
         if r.status_code != 200:
+
             return None
 
 
+
         candles = r.json()["data"]["candles"]
+
 
 
         df = pd.DataFrame(
@@ -108,7 +111,9 @@ def get_candle(instrument_key):
         return df
 
 
+
     except Exception:
+
 
         return None
         results = []
@@ -366,4 +371,3 @@ if __name__ == "__main__":
         port=10000
 
     )
-        
