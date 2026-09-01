@@ -2,51 +2,65 @@ import requests
 import pandas as pd
 from datetime import datetime
 
-# Upstox API Details
-ACCESS_TOKEN = "YOUR_UPSTOX_ACCESS_TOKEN"
+
+# अपना Upstox Access Token यहां डालना है
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+
 
 headers = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}"
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Accept": "application/json"
 }
 
-# NSE Equity symbols (बाद में पूरी list जोड़ेंगे)
+
+# बाद में यहां अपनी पूरी equity list जोड़ सकते हैं
 symbols = [
-    "RIRL",
-    "ASHOKA",
-    "EPL"
+    "NSE_EQ|INE123A01016",
+    "NSE_EQ|INE002A01018",
 ]
 
+
 def get_candle(symbol):
-    url = f"https://api.upstox.com/v3/historical-candle/intraday/NSE_EQ/{symbol}/5minute"
 
-    response = requests.get(url, headers=headers)
-
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-
-    candles = data["data"]["candles"]
-
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "oi"
-        ]
+    url = (
+        "https://api.upstox.com/v3/historical-candle/"
+        f"intraday/{symbol}/5minute"
     )
 
-    return df
+    try:
+        response = requests.get(
+            url,
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            return None
+
+        candles = response.json()["data"]["candles"]
+
+        df = pd.DataFrame(
+            candles,
+            columns=[
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "oi"
+            ]
+        )
+
+        return df
+
+    except Exception:
+        return None
 
 
-def scanner():
 
-    result = []
+def scan():
+
+    results = []
 
     for symbol in symbols:
 
@@ -55,37 +69,73 @@ def scanner():
         if df is None or len(df) < 2:
             continue
 
+
+        # Latest completed candle
         current = df.iloc[0]
+
+        # Previous candle
         previous = df.iloc[1]
 
-        # Red candle + volume higher than previous green candle
-        if (
-            current["close"] < current["open"]
-            and previous["close"] > previous["open"]
-            and current["volume"] > previous["volume"]
-            and current["close"] >= 50
-        ):
 
-            percent = (
+        # Price filter
+        if float(current["close"]) < 50:
+            continue
+
+
+        # Previous Green candle
+        previous_green = (
+            previous["close"] > previous["open"]
+        )
+
+
+        # Current Red candle
+        current_red = (
+            current["close"] < current["open"]
+        )
+
+
+        # Volume condition
+        volume_high = (
+            current["volume"] >
+            previous["volume"]
+        )
+
+
+        if previous_green and current_red and volume_high:
+
+            percentage = (
                 (current["close"] - previous["close"])
                 / previous["close"]
             ) * 100
 
-            result.append(
-                [symbol, current["close"], percent]
+
+            results.append(
+                {
+                    "Symbol": symbol,
+                    "Price": round(float(current["close"]), 2),
+                    "Percentage": round(percentage, 2),
+                    "Volume": int(current["volume"])
+                }
             )
 
 
-    result.sort(
-        key=lambda x: x[2],
+    # Highest percentage first
+    results.sort(
+        key=lambda x: x["Percentage"],
         reverse=True
     )
 
-    print("RedVol5M Scanner Result")
+
+    print("RedVol5M Scanner")
     print(datetime.now())
 
-    for r in result:
-        print(r)
+    if not results:
+        print("No Signal Found")
+
+    else:
+        for item in results:
+            print(item)
 
 
-scanner()
+
+scan()
