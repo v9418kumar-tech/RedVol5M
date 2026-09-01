@@ -4,13 +4,12 @@ import threading
 import requests
 import pandas as pd
 from flask import Flask
-from datetime import datetime
 
 
 app = Flask(__name__)
 
 
-# Render Environment Variables
+# Upstox API
 API_KEY = os.getenv("UPSTOX_API_KEY")
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 
@@ -25,34 +24,31 @@ headers = {
 stocks = []
 
 
-# Upstox instrument file से stock list लेना
-def load_stocks():
+def load_nse_stocks():
 
     global stocks
 
     try:
 
-        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv"
 
-        df = pd.read_json(
-            url,
-            compression="gzip"
-        )
+        df = pd.read_csv(url)
+
+
+        df = df[
+            (df["segment"] == "NSE_EQ") &
+            (df["instrument_type"] == "EQ")
+        ]
 
 
         for _, row in df.iterrows():
 
-            if (
-                row.get("segment") == "NSE_EQ"
-                and row.get("instrument_type") == "EQ"
-            ):
-
-                stocks.append(
-                    {
-                        "name": row["trading_symbol"],
-                        "key": row["instrument_key"]
-                    }
-                )
+            stocks.append(
+                {
+                    "name": row["trading_symbol"],
+                    "key": row["instrument_key"]
+                }
+            )
 
 
         print(
@@ -64,7 +60,7 @@ def load_stocks():
     except Exception as e:
 
         print(
-            "Stock Loading Error:",
+            "Stock loading error:",
             e
         )
 
@@ -80,18 +76,18 @@ def get_candle(instrument_key):
 
     try:
 
-        response = requests.get(
+        r = requests.get(
             url,
             headers=headers,
             timeout=10
         )
 
 
-        if response.status_code != 200:
+        if r.status_code != 200:
             return None
 
 
-        candles = response.json()["data"]["candles"]
+        candles = r.json()["data"]["candles"]
 
 
         df = pd.DataFrame(
@@ -114,13 +110,12 @@ def get_candle(instrument_key):
     except Exception:
 
         return None
-        results = []
 
 
-def scan_market():
+
+results = []def scan_market():
 
     global results
-
 
     while True:
 
@@ -128,7 +123,6 @@ def scan_market():
 
 
         for stock in stocks:
-
 
             df = get_candle(stock["key"])
 
@@ -141,45 +135,40 @@ def scan_market():
                 continue
 
 
-
-            # Latest completed 5 minute candle
-            current = df.iloc[1]
-
-            # Previous completed candle
-            previous = df.iloc[2]
-
-
             try:
+
+                # Latest completed 5 minute candle
+                current = df.iloc[1]
+
+                # Previous completed candle
+                previous = df.iloc[2]
 
 
                 price = float(current["close"])
 
 
-                # Price >= 50
+                # Price filter
                 if price < 50:
                     continue
 
 
 
-                # Previous Green candle
+                # Previous candle green
                 previous_green = (
                     previous["close"] >
                     previous["open"]
                 )
 
 
-
-                # Current Red candle
+                # Current candle red
                 current_red = (
                     current["close"] <
                     current["open"]
                 )
 
 
-
-                # Current Red volume greater
-                # than Previous Green volume
-                volume_condition = (
+                # Current volume higher
+                volume_jump = (
                     current["volume"] >
                     previous["volume"]
                 )
@@ -189,22 +178,20 @@ def scan_market():
                 if (
                     previous_green
                     and current_red
-                    and volume_condition
+                    and volume_jump
                 ):
 
 
                     percent = (
                         (
-                            (
-                                current["close"]
-                                -
-                                previous["close"]
-                            )
-                            /
-                            previous["close"]
+                            current["close"]
+                            -
+                            current["open"]
                         )
-                        * 100
-                    )
+                        /
+                        current["open"]
+                    ) * 100
+
 
 
                     temp.append(
@@ -212,11 +199,9 @@ def scan_market():
                             "name": stock["name"],
                             "price": round(price,2),
                             "volume": int(current["volume"]),
-                            "percent": round(percent,2),
-                            "time": current["time"]
+                            "percent": round(percent,2)
                         }
                     )
-
 
 
             except Exception:
@@ -225,25 +210,15 @@ def scan_market():
 
 
 
-
-        # Percentage high to low sorting
-
         results = sorted(
             temp,
-            key=lambda x: x["percent"],
+            key=lambda x:x["percent"],
             reverse=True
         )
 
 
-        print(
-            datetime.now(),
-            results
-        )
-
-
-        # Next scan after 5 minutes
+        # Scan every 5 minutes
         time.sleep(300)
-
 
 
 
@@ -251,16 +226,20 @@ def scan_market():
 @app.route("/")
 def home():
 
-
     html = """
     <html>
+
+    <head>
+    <title>RedVol5M Scanner</title>
+    </head>
+
 
     <body>
 
     <h1>RedVol5M Scanner</h1>
 
     <h3>
-    Completed 5 Minute Red Candle Signals
+    Completed 5 Minute Candle Signal
     </h3>
 
     """
@@ -268,43 +247,45 @@ def home():
 
     if len(results) == 0:
 
-
         html += "<h2>No Signal Found</h2>"
 
 
     else:
 
-
         html += """
+
         <table border="1" cellpadding="8">
 
         <tr>
         <th>Stock</th>
         <th>Price</th>
         <th>Volume</th>
-        <th>Percentage</th>
+        <th>Red Candle %</th>
         </tr>
+
         """
 
 
         for r in results:
 
-
             html += f"""
 
             <tr>
+
             <td>{r['name']}</td>
+
             <td>{r['price']}</td>
+
             <td>{r['volume']}</td>
+
             <td>{r['percent']}%</td>
+
             </tr>
 
             """
 
 
-
         html += "</table>"
-
 
 
     html += """
@@ -315,8 +296,8 @@ def home():
 
     """
 
-    return html
 
+    return html
 
 
 
@@ -324,7 +305,7 @@ def home():
 if __name__ == "__main__":
 
 
-    load_stocks()
+    load_nse_stocks()
 
 
     thread = threading.Thread(
@@ -340,3 +321,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=10000
     )
+    
