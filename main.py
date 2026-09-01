@@ -18,7 +18,6 @@ app = Flask(__name__)
 
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 
-
 BASE = "https://api.upstox.com"
 
 INSTR_URL = (
@@ -38,13 +37,12 @@ stocks = []
 
 
 # =========================
-# LOAD NSE EQUITY
+# LOAD NSE EQUITY STOCKS
 # =========================
 
 def load_nse_stocks():
 
     global stocks
-
 
     try:
 
@@ -53,9 +51,7 @@ def load_nse_stocks():
             timeout=30
         )
 
-
         r.raise_for_status()
-
 
         raw = r.content
 
@@ -70,21 +66,28 @@ def load_nse_stocks():
         )
 
 
-        stocks = [
+        stocks = []
 
-            {
-                "name": x.get("trading_symbol"),
-                "key": x.get("instrument_key")
-            }
 
-            for x in data
+        for x in data:
 
-            if x.get("segment") == "NSE_EQ"
-            and x.get("instrument_type") == "EQ"
-            and x.get("security_type") == "NORMAL"
-            and x.get("instrument_key")
 
-        ]
+            if (
+                x.get("segment") == "NSE_EQ"
+                and x.get("instrument_type") == "EQ"
+                and x.get("security_type") == "NORMAL"
+                and x.get("instrument_key")
+            ):
+
+                stocks.append(
+                    {
+                        "name":
+                            x.get("trading_symbol"),
+
+                        "key":
+                            x.get("instrument_key")
+                    }
+                )
 
 
         print(
@@ -94,7 +97,6 @@ def load_nse_stocks():
 
 
     except Exception as e:
-
 
         print(
             "Stock loading error:",
@@ -153,10 +155,9 @@ def get_candle(instrument_key):
 
     except Exception:
 
-
         return None
-# =========================         
-# SCANNER LOGIC
+# =========================        
+# SCANNER
 # =========================
 
 results = []
@@ -168,7 +169,6 @@ def scan_market():
 
 
     while True:
-
 
         temp = []
 
@@ -193,7 +193,7 @@ def scan_market():
             try:
 
 
-                # Latest completed candle
+                # Last completed 5 minute candle
 
                 current = df.iloc[1]
 
@@ -217,7 +217,7 @@ def scan_market():
 
 
 
-                # Previous candle green
+                # Previous green candle
 
                 previous_green = (
 
@@ -229,7 +229,7 @@ def scan_market():
 
 
 
-                # Current candle red
+                # Current red candle
 
                 current_red = (
 
@@ -241,7 +241,7 @@ def scan_market():
 
 
 
-                # Volume jump
+                # Current volume greater
 
                 volume_jump = (
 
@@ -264,19 +264,11 @@ def scan_market():
                 ):
 
 
-                    percent = (
+                    multiplier = (
 
-                        (
-                            (
-                                current["close"]
-                                -
-                                current["open"]
-                            )
-                            /
-                            current["open"]
-
-                        )
-                        * 100
+                        float(current["volume"])
+                        /
+                        float(previous["volume"])
 
                     )
 
@@ -284,17 +276,29 @@ def scan_market():
                     temp.append(
 
                         {
-                            "name":
+
+                            "symbol":
                                 stock["name"],
 
+
                             "price":
-                                round(price, 2),
+                                round(price,2),
+
 
                             "volume":
                                 int(current["volume"]),
 
-                            "percent":
-                                round(percent, 2)
+
+                            "avg5":
+                                int(previous["volume"]),
+
+
+                            "multiplier":
+                                round(multiplier,2),
+
+
+                            "time":
+                                current["time"]
 
                         }
 
@@ -307,18 +311,16 @@ def scan_market():
 
 
 
-
         results = sorted(
 
             temp,
 
             key=lambda x:
-                x["percent"],
+                x["multiplier"],
 
             reverse=True
 
         )
-
 
 
         print(
@@ -328,6 +330,7 @@ def scan_market():
 
 
         time.sleep(300)
+
 
 
 
@@ -346,9 +349,7 @@ def home():
 
     <head>
 
-    <title>
-    RedVol5M Scanner
-    </title>
+    <title>ParulScanner 5M</title>
 
     </head>
 
@@ -357,12 +358,12 @@ def home():
 
 
     <h1>
-    RedVol5M Scanner
+    ParulScanner
     </h1>
 
 
     <h3>
-    Completed 5 Minute Candle Signal
+    5-Minute Red Volume Signal Scanner
     </h3>
 
     """
@@ -389,10 +390,13 @@ def home():
 
         <tr>
 
-        <th>Stock</th>
+        <th>Rank</th>
+        <th>Symbol</th>
         <th>Price</th>
         <th>Volume</th>
-        <th>%</th>
+        <th>Previous Volume</th>
+        <th>Jump</th>
+        <th>Time</th>
 
         </tr>
 
@@ -400,20 +404,26 @@ def home():
 
 
 
-        for r in results:
+        for i,r in enumerate(results,1):
 
 
             html += f"""
 
             <tr>
 
-            <td>{r['name']}</td>
+            <td>{i}</td>
 
-            <td>{r['price']}</td>
+            <td>{r['symbol']}</td>
+
+            <td>₹{r['price']}</td>
 
             <td>{r['volume']}</td>
 
-            <td>{r['percent']}%</td>
+            <td>{r['avg5']}</td>
+
+            <td>{r['multiplier']}x</td>
+
+            <td>{r['time']}</td>
 
             </tr>
 
@@ -439,8 +449,9 @@ def home():
 
 
 
+
 # =========================
-# START
+# START SERVER
 # =========================
 
 if __name__ == "__main__":
