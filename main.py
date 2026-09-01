@@ -113,7 +113,8 @@ def get_candle(instrument_key):
 
 
 
-results = []def scan_market():
+results = []
+def scan_market():
 
     global results
 
