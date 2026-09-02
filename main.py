@@ -58,7 +58,6 @@ UPSTOX_INTRADAY = (
     "intraday/{}/minutes/5"
 )
 
-
 state_lock = threading.RLock()
 
 watchlist = list(DEFAULT_WATCHLIST)
@@ -285,8 +284,8 @@ def completed_candles(
                 )
 
             # Candle timestamp is the START time.
-            # Therefore a 5-minute candle is complete
-            # only after timestamp + 5 minutes.
+            # A 5-minute candle is complete only
+            # after timestamp + 5 minutes.
 
             if (
                 timestamp
@@ -452,6 +451,10 @@ def run_scan():
 
         for symbol in symbols:
 
+            if symbol not in mapping:
+
+                continue
+
             futures[
                 executor.submit(
                     fetch_symbol,
@@ -464,9 +467,19 @@ def run_scan():
             futures
         ):
 
-            symbol, candles, error = (
-                future.result()
-            )
+            try:
+
+                symbol, candles, error = (
+                    future.result()
+                )
+
+            except Exception as error:
+
+                symbol = futures[future]
+
+                candles = None
+
+                error = str(error)
 
             if error:
 
@@ -476,12 +489,14 @@ def run_scan():
 
                 continue
 
-            results.append(
-                (
-                    symbol,
-                    candles
+            if candles:
+
+                results.append(
+                    (
+                        symbol,
+                        candles
+                    )
                 )
-            )
 
     new_signals = []
 
@@ -645,8 +660,6 @@ def scanner_loop():
 
     global scanner_started
     global last_scan_bucket
-    global feed_status
-    global feed_message
 
     try:
 
@@ -654,9 +667,7 @@ def scanner_loop():
 
         with state_lock:
 
-            feed_status = "ACTIVE"
-
-            feed_message = (
+            feed_status_text = (
                 f"NSE instruments loaded: {total}"
             )
 
@@ -668,9 +679,9 @@ def scanner_loop():
 
         with state_lock:
 
-            feed_status = "ERROR"
+            globals()["feed_status"] = "ERROR"
 
-            feed_message = (
+            globals()["feed_message"] = (
                 f"NSE instrument file error: "
                 f"{error}"
             )
@@ -737,7 +748,7 @@ def scanner_loop():
             )
 
             # Run immediately after each
-            # 5-minute candle completes.
+            # completed 5-minute candle.
 
             if (
                 market_open
@@ -916,6 +927,10 @@ def status():
 def add():
 
     global watchlist
+    global signals
+    global last_update
+    global feed_status
+    global feed_message
 
     symbol = (
         request.form
@@ -930,7 +945,9 @@ def add():
             watchlist
         )
 
-    message = ""
+        mapping = dict(
+            instrument_map
+        )
 
     if not symbol:
 
@@ -938,43 +955,127 @@ def add():
             "Share ka naam likhiye."
         )
 
-    elif symbol in current_list:
+        response = make_response(
+            jsonify({
+                "ok": False,
+                "message": message,
+                "watchlist": current_list
+            })
+        )
+
+        response.set_cookie(
+            "rv5m_watchlist",
+            cookie_value(current_list),
+            max_age=31536000,
+            samesite="Lax"
+        )
+
+        return response
+
+    if symbol in current_list:
 
         message = (
             f"{symbol} pehle se list mein hai."
         )
 
-    elif symbol not in instrument_map:
+        response = make_response(
+            jsonify({
+                "ok": False,
+                "message": message,
+                "watchlist": current_list
+            })
+        )
+
+        response.set_cookie(
+            "rv5m_watchlist",
+            cookie_value(current_list),
+            max_age=31536000,
+            samesite="Lax"
+        )
+
+        return response
+
+    if symbol not in mapping:
 
         message = (
             f"{symbol} NSE equity list "
             f"mein nahi mila."
         )
 
-    else:
-
-        current_list.append(
-            symbol
+        response = make_response(
+            jsonify({
+                "ok": False,
+                "message": message,
+                "watchlist": current_list
+            })
         )
 
-        current_list = clean_symbols(
-            current_list
+        response.set_cookie(
+            "rv5m_watchlist",
+            cookie_value(current_list),
+            max_age=31536000,
+            samesite="Lax"
         )
+
+        return response
+
+    # -----------------------------------------------------
+    # ADD NEW SHARE
+    # -----------------------------------------------------
+
+    current_list.append(symbol)
+
+    current_list = clean_symbols(
+        current_list
+    )
+
+    with state_lock:
+
+        watchlist = current_list
+
+        feed_status = "ACTIVE"
+
+        feed_message = (
+            f"{symbol} added. "
+            f"Immediate scan running..."
+        )
+
+    # -----------------------------------------------------
+    # IMPORTANT CHANGE:
+    #
+    # ADD ke baad scan ab background mein
+    # start nahi hoga.
+    #
+    # Pehle scan COMPLETE hoga,
+    # phir ADD response browser ko milega.
+    #
+    # Isse market band hone ke baad bhi
+    # latest completed candles turant check hongi.
+    # -----------------------------------------------------
+
+    try:
+
+        run_scan()
+
+        message = (
+            f"{symbol} add ho gaya aur "
+            f"turant scan bhi ho gaya."
+        )
+
+    except Exception as error:
 
         with state_lock:
 
-            watchlist = current_list
+            feed_status = "ERROR"
+
+            feed_message = (
+                f"Scan error: {error}"
+            )
 
         message = (
-            f"{symbol} add ho gaya."
+            f"{symbol} add ho gaya, "
+            f"lekin scan mein error aaya."
         )
-
-        # Scan again with new share
-
-        threading.Thread(
-            target=run_scan,
-            daemon=True
-        ).start()
 
     response = make_response(
         jsonify({
@@ -985,7 +1086,10 @@ def add():
                 message,
 
             "watchlist":
-                current_list
+                current_list,
+
+            "signals":
+                list(signals)
         })
     )
 
@@ -1047,6 +1151,8 @@ def remove():
         max_age=31536000,
         samesite="Lax"
     )
+
+    # REMOVE ke baad bhi fresh scan
 
     threading.Thread(
         target=run_scan,
@@ -1596,6 +1702,7 @@ function render(data){
 
 
     if(
+        !data.signals ||
         !data.signals.length
     ){
 
@@ -1701,6 +1808,10 @@ async function refreshStatus(){
 }
 
 
+// ---------------------------------------------------------
+// ADD
+// ---------------------------------------------------------
+
 document
 .getElementById('addForm')
 .addEventListener(
@@ -1709,57 +1820,76 @@ document
 
         event.preventDefault();
 
-
         const input =
             document.getElementById(
                 'addInput'
             );
 
+        const button =
+            this.querySelector(
+                'button'
+            );
+
+        button.disabled = true;
+
+        button.textContent =
+            'SCANNING...';
 
         const formData =
             new FormData();
-
 
         formData.append(
             'symbol',
             input.value
         );
 
+        try{
 
-        const response =
-            await fetch(
-                '/add',
-                {
-                    method:'POST',
-                    body:formData
-                }
-            );
+            const response =
+                await fetch(
+                    '/add',
+                    {
+                        method:'POST',
+                        body:formData
+                    }
+                );
 
+            const data =
+                await response.json();
 
-        const data =
-            await response.json();
+            document.getElementById(
+                'msg'
+            ).textContent =
+                data.message;
 
+            input.value = '';
 
-        document.getElementById(
-            'msg'
-        ).textContent =
-            data.message;
+            await refreshStatus();
 
+            input.focus();
 
-        input.value = '';
+        }
+        catch(error){
 
+            document.getElementById(
+                'msg'
+            ).textContent =
+                'ADD mein error aaya.';
 
-        input.focus();
+        }
 
+        button.disabled = false;
 
-        setTimeout(
-            refreshStatus,
-            800
-        );
+        button.textContent =
+            'ADD';
 
     }
 );
 
+
+// ---------------------------------------------------------
+// REMOVE
+// ---------------------------------------------------------
 
 document
 .getElementById('removeForm')
@@ -1769,59 +1899,79 @@ document
 
         event.preventDefault();
 
-
         const input =
             document.getElementById(
                 'removeInput'
             );
 
+        const button =
+            this.querySelector(
+                'button'
+            );
+
+        button.disabled = true;
+
+        button.textContent =
+            'REMOVING...';
 
         const formData =
             new FormData();
-
 
         formData.append(
             'symbol',
             input.value
         );
 
+        try{
 
-        const response =
-            await fetch(
-                '/remove',
-                {
-                    method:'POST',
-                    body:formData
-                }
-            );
+            const response =
+                await fetch(
+                    '/remove',
+                    {
+                        method:'POST',
+                        body:formData
+                    }
+                );
 
+            const data =
+                await response.json();
 
-        const data =
-            await response.json();
+            document.getElementById(
+                'msg'
+            ).textContent =
+                data.message;
 
+            input.value = '';
 
-        document.getElementById(
-            'msg'
-        ).textContent =
-            data.message;
+            await refreshStatus();
 
+            input.focus();
 
-        input.value = '';
+        }
+        catch(error){
 
+            document.getElementById(
+                'msg'
+            ).textContent =
+                'REMOVE mein error aaya.';
 
-        input.focus();
+        }
 
+        button.disabled = false;
 
-        refreshStatus();
+        button.textContent =
+            'REMOVE';
 
     }
 );
 
 
+// ---------------------------------------------------------
 // IMPORTANT:
-// Page reload नहीं होगा.
-// सिर्फ data update होगा.
-// इसलिए keyboard बंद नहीं होगा.
+// Page reload nahi hoga.
+// Sirf data update hoga.
+// Keyboard bana rahega.
+// ---------------------------------------------------------
 
 setInterval(
     refreshStatus,
