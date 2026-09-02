@@ -26,7 +26,6 @@ INSTR_URL = (
     "complete.json.gz"
 )
 
-
 headers = {
     "Accept": "application/json",
     "Authorization": f"Bearer {ACCESS_TOKEN}"
@@ -34,6 +33,11 @@ headers = {
 
 
 stocks = []
+results = []
+
+last_scan_time = "Not started"
+scan_status = "Starting..."
+lock = threading.Lock()
 
 
 # =========================
@@ -43,6 +47,7 @@ stocks = []
 def load_nse_stocks():
 
     global stocks
+    global scan_status
 
     try:
 
@@ -62,9 +67,7 @@ def load_nse_stocks():
             raw.decode("utf-8")
         )
 
-
         stocks = []
-
 
         for x in data:
 
@@ -82,12 +85,14 @@ def load_nse_stocks():
                     }
                 )
 
-
         print(
             "Total NSE Equity Loaded:",
             len(stocks)
         )
 
+        scan_status = (
+            f"{len(stocks)} NSE Equity Stocks Loaded"
+        )
 
     except Exception as e:
 
@@ -95,6 +100,11 @@ def load_nse_stocks():
             "Stock loading error:",
             e
         )
+
+        scan_status = (
+            "Stock loading error"
+        )
+
 
 # =========================
 # GET 5 MINUTE CANDLE
@@ -108,7 +118,6 @@ def get_candle(instrument_key):
         + f"intraday/{instrument_key}/5minute"
     )
 
-
     try:
 
         r = requests.get(
@@ -117,14 +126,21 @@ def get_candle(instrument_key):
             timeout=10
         )
 
-
         if r.status_code != 200:
 
             return None
 
+        data = r.json()
 
-        candles = r.json()["data"]["candles"]
+        candles = (
+            data
+            .get("data", {})
+            .get("candles", [])
+        )
 
+        if not candles:
+
+            return None
 
         df = pd.DataFrame(
             candles,
@@ -139,125 +155,191 @@ def get_candle(instrument_key):
             ]
         )
 
-
         return df
-
 
     except Exception:
 
         return None
 
 
-
 # =========================
 # SCANNER
 # =========================
 
-results = []
-
-
 def scan_market():
 
     global results
-
+    global last_scan_time
+    global scan_status
 
     while True:
 
         temp = []
 
+        successful = 0
+        failed = 0
+
+        print("----- NEW SCAN STARTED -----")
 
         for stock in stocks:
-
 
             df = get_candle(
                 stock["key"]
             )
 
-
             if df is None:
+
+                failed += 1
                 continue
 
+            successful += 1
 
             if len(df) < 3:
-                continue
 
+                continue
 
             try:
 
+                # Upstox candles are newest first.
+                # iloc[1] = latest completed 5-min candle
+                # iloc[2] = candle before it
+
                 current = df.iloc[1]
-
                 previous = df.iloc[2]
-
 
                 price = float(
                     current["close"]
                 )
 
-
+                # Price must be ₹50 or above
                 if price < 50:
+
                     continue
 
-
                 previous_green = (
-                    previous["close"]
+                    float(previous["close"])
                     >
-                    previous["open"]
+                    float(previous["open"])
                 )
-
 
                 current_red = (
-                    current["close"]
+                    float(current["close"])
                     <
-                    current["open"]
+                    float(current["open"])
                 )
 
+                current_volume = int(
+                    current["volume"]
+                )
+
+                previous_volume = int(
+                    previous["volume"]
+                )
 
                 jump = (
+                    current_volume
+                    -
+                    previous_volume
+                )
 
-    int(current["volume"])
-    -
-    int(previous["volume"])
-
-)
-
+                # =========================
+                # SIGNAL CONDITION
+                # =========================
 
                 if (
                     previous_green
                     and
                     current_red
                     and
-                    current["volume"] > previous["volume"]
+                    current_volume > previous_volume
                 ):
-
-
-                    jump = (
-    int(current["volume"])
-    -
-    int(previous["volume"])
-)
-
 
                     temp.append(
                         {
                             "symbol": stock["name"],
-                            "price": round(price,2),
-                            "volume": int(current["volume"]),
-                            "avg5": int(previous["volume"]),
+                            "price": round(
+                                price,
+                                2
+                            ),
+                            "volume": current_volume,
+                            "avg5": previous_volume,
                             "jump": jump,
                             "time": current["time"]
                         }
                     )
 
-
             except Exception:
 
                 continue
-# ========================= 
+
+
+        # =========================
+        # VERY IMPORTANT
+        # UPDATE RESULTS
+        # =========================
+
+        with lock:
+
+            results = sorted(
+                temp,
+                key=lambda x: x["jump"],
+                reverse=True
+            )
+
+            last_scan_time = time.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+
+            scan_status = (
+                f"Scan complete | "
+                f"Checked: {successful} | "
+                f"Failed: {failed} | "
+                f"Signals: {len(results)}"
+            )
+
+
+        print(
+            "Signals Found:",
+            len(results)
+        )
+
+        print(
+            "Successful:",
+            successful,
+            "Failed:",
+            failed
+        )
+
+        print(
+            "Last Scan:",
+            last_scan_time
+        )
+
+        print(
+            "----- SCAN COMPLETE -----"
+        )
+
+
+        # =========================
+        # WAIT BEFORE NEXT SCAN
+        # =========================
+
+        time.sleep(60)
+
+
+# =========================
 # WEB PAGE
 # =========================
 
 @app.route("/")
 def home():
+
+    with lock:
+
+        current_results = list(results)
+        current_last_scan = last_scan_time
+        current_status = scan_status
+
 
     html = """
 
@@ -267,11 +349,20 @@ def home():
 
     <title>RedVol5M Scanner</title>
 
+    <meta
+        http-equiv="refresh"
+        content="60"
+    >
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
     </head>
 
 
     <body>
-
 
     <h1>
     RedVol5M Scanner
@@ -282,16 +373,31 @@ def home():
     5 Minute Volume Signal
     </h3>
 
+    <p>
+    <b>Last Scan:</b>
+    """ + current_last_scan + """
+    </p>
+
+    <p>
+    <b>Status:</b>
+    """ + current_status + """
+    </p>
+
     """
 
 
-    if not results:
+    # =========================
+    # NO SIGNAL
+    # =========================
 
+    if not current_results:
 
         html += """
+
         <table border="1" cellpadding="8">
 
         <tr>
+
         <th>Rank</th>
         <th>Symbol</th>
         <th>Price</th>
@@ -299,26 +405,37 @@ def home():
         <th>Previous Volume</th>
         <th>Jump</th>
         <th>Time</th>
+
         </tr>
 
         <tr>
-        <td colspan="7" align="center">
+
+        <td colspan="7"
+            align="center">
+
         No Signal Found
+
         </td>
+
         </tr>
 
         </table>
+
         """
 
 
-    else:
+    # =========================
+    # SIGNAL RESULTS
+    # =========================
 
+    else:
 
         html += """
 
         <table border="1" cellpadding="8">
 
         <tr>
+
         <th>Rank</th>
         <th>Symbol</th>
         <th>Price</th>
@@ -326,34 +443,64 @@ def home():
         <th>Previous Volume</th>
         <th>Jump</th>
         <th>Time</th>
+
         </tr>
 
         """
 
 
-        for i,r in enumerate(results,1):
+        for i, r in enumerate(
+            current_results,
+            1
+        ):
 
             html += f"""
 
             <tr>
 
             <td>{i}</td>
-            <td>{r['symbol']}</td>
-            <td>{r['price']}</td>
-            <td>{r['volume']}</td>
-            <td>{r['avg5']}</td>
-            <td>{r['jump']}</td>
-            <td>{r['time']}</td>
+
+            <td>
+            {r['symbol']}
+            </td>
+
+            <td>
+            {r['price']}
+            </td>
+
+            <td>
+            {r['volume']}
+            </td>
+
+            <td>
+            {r['avg5']}
+            </td>
+
+            <td>
+            {r['jump']}
+            </td>
+
+            <td>
+            {r['time']}
+            </td>
 
             </tr>
 
             """
 
 
-        html += "</table>"
+        html += """
+
+        </table>
+
+        """
 
 
     html += """
+
+    <p>
+    Page automatically refreshes every 60 seconds.
+    </p>
 
     </body>
 
@@ -361,9 +508,7 @@ def home():
 
     """
 
-
     return html
-
 
 
 # =========================
@@ -371,7 +516,6 @@ def home():
 # =========================
 
 if __name__ == "__main__":
-
 
     load_nse_stocks()
 
@@ -381,7 +525,6 @@ if __name__ == "__main__":
         daemon=True
     )
 
-
     thread.start()
 
 
@@ -389,6 +532,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=10000
     )
-
-
-
