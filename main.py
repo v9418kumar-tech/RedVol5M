@@ -1,81 +1,131 @@
 import os
-import time
 import gzip
 import json
 import threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
 
 import requests
 from flask import Flask, render_template_string
 
+import upstox_client
+
+
 # ============================================================
-# REDVOL5M - FULL NSE 5-MINUTE SCANNER
+# REDVOL5M
+# FULL NSE • 5-MINUTE • TOP 10
+# LIVE MARKET DATA VERSION
 # ============================================================
 
 app = Flask(__name__)
 
-ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+ACCESS_TOKEN = os.environ.get(
+    "UPSTOX_ACCESS_TOKEN",
+    ""
+).strip()
 
 INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+    "https://assets.upstox.com/market-quote/"
+    "instruments/exchange/complete.json.gz"
 )
 
-API_BASE = "https://api.upstox.com"
-
-# -----------------------------
-# SCANNER SETTINGS
-# -----------------------------
-
-TIMEFRAME = 5
-
-# Maximum signals shown on website
 TOP_RESULTS = 10
-
-# Upstox limit is 500/min.
-# Keep our scanner comfortably below that.
-BATCH_SIZE = 400
-
-# Small gap between requests
-REQUEST_DELAY = 0.12
-
-# Wait before starting the next full-market batch
-BATCH_WAIT = 60
-
-# Minimum share price
 MIN_PRICE = 50
+TIMEFRAME_MINUTES = 5
 
-# -----------------------------
-# GLOBAL VARIABLES
-# -----------------------------
+IST = timezone(
+    timedelta(hours=5, minutes=30)
+)
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+lock = threading.RLock()
 
 results = []
 
-lock = threading.Lock()
-
-last_scan_time = "Not scanned yet"
-
-scan_status = "Starting scanner..."
-
 total_nse = 0
-current_batch = 0
-total_batches = 0
 
 successful = 0
 failed = 0
 
+last_scan_time = "Not ready"
+last_completed_candle = "Not ready"
+
+scan_status = "Starting live market feed..."
+
+feed_connected = False
+
 scanner_started = False
 
+streamer = None
+
+instrument_keys = []
+
+symbol_by_key = {}
+
+# Current live 5-minute candle for every share
+current_candles = {}
+
+# Last completed candles
+# Each symbol keeps maximum 2 candles
+completed_candles = {}
+
+# Last processed trade timestamp
+last_trade_timestamp = {}
+
+# First live candle bucket
+# The first candle after connection is discarded
+# because the scanner may start in the middle of a candle.
+warmup_bucket = None
+
+last_rotated_bucket = None
+
 
 # ============================================================
-# INDIA TIME
+# TIME FUNCTIONS
 # ============================================================
-
-IST = timezone(timedelta(hours=5, minutes=30))
-
 
 def now_ist():
+
     return datetime.now(IST)
+
+
+def candle_bucket(dt):
+
+    dt = dt.astimezone(IST)
+
+    minute = (
+        dt.minute // TIMEFRAME_MINUTES
+    ) * TIMEFRAME_MINUTES
+
+    return dt.replace(
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+
+def bucket_from_timestamp(timestamp):
+
+    try:
+
+        ms = int(
+            float(timestamp)
+        )
+
+        dt = datetime.fromtimestamp(
+            ms / 1000,
+            tz=IST
+        )
+
+        return candle_bucket(dt)
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
@@ -84,9 +134,15 @@ def now_ist():
 
 def load_nse_equities():
 
-    print("Loading NSE instruments...")
+    global total_nse
+
+    print("")
+    print("====================================")
+    print("LOADING NSE EQUITY INSTRUMENTS")
+    print("====================================")
 
     try:
+
         response = requests.get(
             INSTRUMENT_URL,
             timeout=30
@@ -94,11 +150,15 @@ def load_nse_equities():
 
         response.raise_for_status()
 
-        data = gzip.decompress(response.content)
+        raw_data = gzip.decompress(
+            response.content
+        )
 
-        instruments = json.loads(data.decode("utf-8"))
+        instruments = json.loads(
+            raw_data.decode("utf-8")
+        )
 
-        stocks = []
+        unique = {}
 
         for item in instruments:
 
@@ -110,170 +170,123 @@ def load_nse_equities():
                 if item.get("instrument_type") != "EQ":
                     continue
 
-                trading_symbol = item.get("trading_symbol")
-                instrument_key = item.get("instrument_key")
-
-                if not trading_symbol or not instrument_key:
-                    continue
-
-                stocks.append(
-                    {
-                        "symbol": trading_symbol,
-                        "instrument_key": instrument_key
-                    }
+                symbol = item.get(
+                    "trading_symbol"
                 )
 
+                key = item.get(
+                    "instrument_key"
+                )
+
+                if not symbol or not key:
+                    continue
+
+                unique[symbol] = {
+                    "symbol": symbol,
+                    "instrument_key": key
+                }
+
             except Exception:
+
                 continue
 
-        # Remove duplicate symbols
-        unique = {}
+        stocks = list(
+            unique.values()
+        )
+
+        stocks.sort(
+            key=lambda x: x["symbol"]
+        )
+
+        instrument_keys.clear()
+        symbol_by_key.clear()
 
         for stock in stocks:
-            unique[stock["symbol"]] = stock
 
-        stocks = list(unique.values())
+            key = stock["instrument_key"]
+            symbol = stock["symbol"]
 
-        stocks.sort(key=lambda x: x["symbol"])
+            instrument_keys.append(
+                key
+            )
 
-        print("====================================")
-        print("TOTAL NSE EQUITY LOADED:", len(stocks))
+            symbol_by_key[key] = symbol
+
+        total_nse = len(
+            instrument_keys
+        )
+
+        print("")
+        print(
+            "NSE EQUITY LOADED:",
+            total_nse
+        )
+
         print("====================================")
 
         return stocks
 
     except Exception as e:
 
-        print("INSTRUMENT LOAD ERROR:", str(e))
+        print(
+            "INSTRUMENT LOAD ERROR:",
+            str(e)
+        )
+
+        total_nse = 0
 
         return []
 
 
 # ============================================================
-# GET 5-MINUTE CANDLES
+# RESET LIVE CANDLE DATA
 # ============================================================
 
-def get_candles(instrument_key):
+def reset_live_data():
 
-    encoded_key = quote(
-        instrument_key,
-        safe=""
-    )
+    global results
+    global last_scan_time
+    global last_completed_candle
+    global warmup_bucket
+    global last_rotated_bucket
+    global successful
+    global failed
 
-    url = (
-        f"{API_BASE}/v3/historical-candle/intraday/"
-        f"{encoded_key}/minutes/5"
-    )
+    with lock:
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {ACCESS_TOKEN}"
-    }
+        current_candles.clear()
 
-    try:
+        completed_candles.clear()
 
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
+        last_trade_timestamp.clear()
 
-        if response.status_code != 200:
+        results = []
 
-            return None
+        warmup_bucket = None
 
-        data = response.json()
+        last_rotated_bucket = None
 
-        candles = (
-            data.get("data", {})
-                .get("candles", [])
-        )
+        last_scan_time = "Waiting for candles"
 
-        if not candles:
-            return None
+        last_completed_candle = "Waiting for candles"
 
-        return candles
+        successful = 0
+        failed = 0
 
-    except Exception:
+
+# ============================================================
+# CHECK SIGNAL
+# ============================================================
+
+def make_signal(symbol, candles):
+
+    if len(candles) < 2:
 
         return None
 
+    previous = candles[-2]
 
-# ============================================================
-# FIND LATEST COMPLETED 5-MINUTE CANDLE
-# ============================================================
-
-def get_completed_candles(candles):
-
-    completed = []
-
-    current_time = now_ist()
-
-    # Current 5-minute candle start
-    minute = (current_time.minute // 5) * 5
-
-    current_bucket = current_time.replace(
-        minute=minute,
-        second=0,
-        microsecond=0
-    )
-
-    for candle in candles:
-
-        if len(candle) < 6:
-            continue
-
-        try:
-
-            timestamp = candle[0]
-
-            candle_time = datetime.fromisoformat(
-                timestamp
-            )
-
-            # Make timezone aware if necessary
-            if candle_time.tzinfo is None:
-                candle_time = candle_time.replace(
-                    tzinfo=IST
-                )
-
-            # Only COMPLETED candles
-            if candle_time < current_bucket:
-
-                completed.append(
-                    {
-                        "time": candle_time,
-                        "open": float(candle[1]),
-                        "high": float(candle[2]),
-                        "low": float(candle[3]),
-                        "close": float(candle[4]),
-                        "volume": float(candle[5])
-                    }
-                )
-
-        except Exception:
-            continue
-
-    completed.sort(
-        key=lambda x: x["time"]
-    )
-
-    return completed
-
-
-# ============================================================
-# CHECK USER'S SIGNAL CONDITIONS
-# ============================================================
-
-def check_signal(symbol, candles):
-
-    completed = get_completed_candles(candles)
-
-    if len(completed) < 2:
-        return None
-
-    previous = completed[-2]
-    current = completed[-1]
+    current = candles[-1]
 
     previous_open = previous["open"]
     previous_close = previous["close"]
@@ -284,44 +297,51 @@ def check_signal(symbol, candles):
     previous_volume = previous["volume"]
     current_volume = current["volume"]
 
+
     # --------------------------------------------------------
-    # CONDITIONS
-    #
-    # 1. Previous candle GREEN
-    # 2. Current completed candle RED
-    # 3. Current volume > previous volume
-    # 4. Price >= Rs 50
+    # CONDITION 1
+    # PREVIOUS CANDLE GREEN
     # --------------------------------------------------------
 
-    previous_green = (
-        previous_close > previous_open
-    )
+    if previous_close <= previous_open:
 
-    current_red = (
-        current_close < current_open
-    )
-
-    volume_higher = (
-        current_volume > previous_volume
-    )
-
-    price_condition = (
-        current_close >= MIN_PRICE
-    )
-
-    if not previous_green:
         return None
 
-    if not current_red:
+
+    # --------------------------------------------------------
+    # CONDITION 2
+    # CURRENT COMPLETED CANDLE RED
+    # --------------------------------------------------------
+
+    if current_close >= current_open:
+
         return None
 
-    if not volume_higher:
+
+    # --------------------------------------------------------
+    # CONDITION 3
+    # CURRENT VOLUME > PREVIOUS VOLUME
+    # --------------------------------------------------------
+
+    if current_volume <= previous_volume:
+
         return None
 
-    if not price_condition:
+
+    # --------------------------------------------------------
+    # CONDITION 4
+    # PRICE >= ₹50
+    # --------------------------------------------------------
+
+    if current_close < MIN_PRICE:
+
         return None
 
-    # Volume jump
+
+    # --------------------------------------------------------
+    # VOLUME JUMP
+    # --------------------------------------------------------
+
     if previous_volume > 0:
 
         jump = (
@@ -333,12 +353,29 @@ def check_signal(symbol, candles):
 
         jump = 0
 
+
     return {
+
         "symbol": symbol,
-        "price": round(current_close, 2),
-        "volume": int(current_volume),
-        "previous_volume": int(previous_volume),
-        "jump": round(jump, 2),
+
+        "price": round(
+            current_close,
+            2
+        ),
+
+        "volume": int(
+            current_volume
+        ),
+
+        "previous_volume": int(
+            previous_volume
+        ),
+
+        "jump": round(
+            jump,
+            2
+        ),
+
         "time": current["time"].strftime(
             "%H:%M"
         )
@@ -346,108 +383,724 @@ def check_signal(symbol, candles):
 
 
 # ============================================================
-# SCAN ONE BATCH
+# REBUILD TOP 10
 # ============================================================
 
-def scan_batch(stocks, batch_number):
+def rebuild_top_results(target_bucket):
 
+    global results
+    global last_scan_time
+    global last_completed_candle
+    global scan_status
     global successful
     global failed
 
-    temp_signals = []
+    fresh_signals = []
 
-    start = (
-        batch_number * BATCH_SIZE
-    )
+    checked = 0
 
-    end = min(
-        start + BATCH_SIZE,
-        len(stocks)
-    )
+    for key, candles in completed_candles.items():
 
-    batch = stocks[start:end]
-
-    print("")
-    print("====================================")
-    print(
-        f"SCANNING BATCH "
-        f"{batch_number + 1}/{total_batches}"
-    )
-    print(
-        f"Stocks: {start + 1} - {end}"
-    )
-    print("====================================")
-
-    batch_success = 0
-    batch_failed = 0
-
-    for stock in batch:
-
-        symbol = stock["symbol"]
-
-        candles = get_candles(
-            stock["instrument_key"]
+        symbol = symbol_by_key.get(
+            key
         )
 
-        if candles is None:
-
-            batch_failed += 1
-
-            time.sleep(
-                REQUEST_DELAY
-            )
-
+        if not symbol:
             continue
 
-        batch_success += 1
+        if len(candles) < 2:
+            continue
 
-        signal = check_signal(
+        latest = candles[-1]
+
+        # Only use the newest completed
+        # 5-minute candle.
+        if latest["time"] != target_bucket:
+            continue
+
+        checked += 1
+
+        signal = make_signal(
             symbol,
             candles
         )
 
         if signal is not None:
 
-            temp_signals.append(
+            fresh_signals.append(
                 signal
             )
 
-            print(
-                "SIGNAL:",
-                symbol,
-                "| Price:",
-                signal["price"],
-                "| Jump:",
-                signal["jump"],
-                "X"
-            )
 
-        time.sleep(
-            REQUEST_DELAY
+    # Strongest volume jump first
+    fresh_signals.sort(
+        key=lambda x: x["jump"],
+        reverse=True
+    )
+
+
+    # IMPORTANT:
+    # Completely replace old results.
+    # Nothing from the previous 5-minute
+    # scan is carried forward.
+
+    results = fresh_signals[
+        :TOP_RESULTS
+    ]
+
+
+    successful = checked
+
+    failed = max(
+        0,
+        total_nse - checked
+    )
+
+
+    last_completed_candle = (
+        target_bucket.strftime(
+            "%H:%M"
+        )
+    )
+
+    last_scan_time = (
+        now_ist().strftime(
+            "%d-%m-%Y %H:%M:%S"
+        )
+    )
+
+
+    scan_status = (
+        "Live Feed Connected | "
+        "Fresh 5-Minute Scan | "
+        f"Signals: {len(results)}"
+    )
+
+
+    print("")
+    print("====================================")
+    print(
+        "NEW 5-MINUTE SCAN:",
+        target_bucket.strftime(
+            "%H:%M"
+        )
+    )
+
+    print(
+        "Checked:",
+        checked,
+        "/",
+        total_nse
+    )
+
+    print(
+        "TOP SIGNALS:",
+        len(results)
+    )
+
+    print("====================================")
+
+
+    for index, signal in enumerate(
+        results,
+        start=1
+    ):
+
+        print(
+            f"{index}. "
+            f"{signal['symbol']} | "
+            f"₹{signal['price']} | "
+            f"{signal['jump']}X"
         )
 
-    successful += batch_success
-    failed += batch_failed
 
-    return temp_signals
+# ============================================================
+# PROCESS LIVE TRADE
+# ============================================================
+
+def process_trade(
+    instrument_key,
+    ltp,
+    ltq,
+    ltt
+):
+
+    global warmup_bucket
+
+    try:
+
+        price = float(ltp)
+
+        quantity = float(
+            ltq or 0
+        )
+
+        timestamp = int(
+            float(ltt)
+        )
+
+    except Exception:
+
+        return
+
+
+    bucket = bucket_from_timestamp(
+        timestamp
+    )
+
+    if bucket is None:
+        return
+
+
+    # --------------------------------------------------------
+    # First received candle is treated as
+    # partial because scanner may start
+    # in the middle of a 5-minute candle.
+    # --------------------------------------------------------
+
+    if warmup_bucket is None:
+
+        warmup_bucket = bucket
+
+        print(
+            "Warm-up candle:",
+            bucket.strftime("%H:%M")
+        )
+
+
+    # --------------------------------------------------------
+    # Ignore duplicate trade update
+    # --------------------------------------------------------
+
+    previous_timestamp = (
+        last_trade_timestamp.get(
+            instrument_key
+        )
+    )
+
+    if (
+        previous_timestamp is not None
+        and timestamp <= previous_timestamp
+    ):
+
+        return
+
+
+    last_trade_timestamp[
+        instrument_key
+    ] = timestamp
+
+
+    # --------------------------------------------------------
+    # GET CURRENT CANDLE
+    # --------------------------------------------------------
+
+    current = current_candles.get(
+        instrument_key
+    )
+
+
+    # --------------------------------------------------------
+    # FIRST CANDLE FOR SYMBOL
+    # --------------------------------------------------------
+
+    if current is None:
+
+        current_candles[
+            instrument_key
+        ] = {
+
+            "time": bucket,
+
+            "open": price,
+
+            "high": price,
+
+            "low": price,
+
+            "close": price,
+
+            "volume": quantity
+        }
+
+        return
+
+
+    # --------------------------------------------------------
+    # NEW 5-MINUTE BUCKET
+    # --------------------------------------------------------
+
+    if bucket > current["time"]:
+
+        # Finalize previous candle
+        completed = current.copy()
+
+        # Only save candles after warm-up.
+        if completed["time"] != warmup_bucket:
+
+            completed_candles.setdefault(
+                instrument_key,
+                deque(maxlen=2)
+            )
+
+            completed_candles[
+                instrument_key
+            ].append(
+                completed
+            )
+
+
+        # Start new candle
+        current_candles[
+            instrument_key
+        ] = {
+
+            "time": bucket,
+
+            "open": price,
+
+            "high": price,
+
+            "low": price,
+
+            "close": price,
+
+            "volume": quantity
+        }
+
+        return
+
+
+    # --------------------------------------------------------
+    # OLD / OUT-OF-ORDER UPDATE
+    # --------------------------------------------------------
+
+    if bucket < current["time"]:
+
+        return
+
+
+    # --------------------------------------------------------
+    # UPDATE CURRENT CANDLE
+    # --------------------------------------------------------
+
+    current["high"] = max(
+        current["high"],
+        price
+    )
+
+    current["low"] = min(
+        current["low"],
+        price
+    )
+
+    current["close"] = price
+
+    current["volume"] += quantity
 
 
 # ============================================================
-# MAIN SCANNER
+# FINALIZE CANDLES AT EVERY 5-MINUTE BOUNDARY
 # ============================================================
 
-def scanner():
+def rotate_candles():
 
-    global results
-    global last_scan_time
+    global last_rotated_bucket
+
+    while True:
+
+        try:
+
+            current_bucket = candle_bucket(
+                now_ist()
+            )
+
+
+            if (
+                last_rotated_bucket
+                == current_bucket
+            ):
+
+                # Check again after 1 second
+                import time
+                time.sleep(1)
+
+                continue
+
+
+            last_rotated_bucket = (
+                current_bucket
+            )
+
+
+            target_bucket = (
+                current_bucket
+                - timedelta(
+                    minutes=TIMEFRAME_MINUTES
+                )
+            )
+
+
+            with lock:
+
+                # Finalize every current candle
+                for key in list(
+                    current_candles.keys()
+                ):
+
+                    current = current_candles.get(
+                        key
+                    )
+
+                    if current is None:
+                        continue
+
+
+                    if current["time"] >= current_bucket:
+
+                        continue
+
+
+                    completed = current.copy()
+
+
+                    # Do not use the first
+                    # partial warm-up candle.
+                    if (
+                        completed["time"]
+                        != warmup_bucket
+                    ):
+
+                        completed_candles.setdefault(
+                            key,
+                            deque(maxlen=2)
+                        )
+
+                        completed_candles[
+                            key
+                        ].append(
+                            completed
+                        )
+
+
+                    del current_candles[
+                        key
+                    ]
+
+
+                # ------------------------------------------------
+                # Need at least two complete candles
+                # before calculating signals.
+                # ------------------------------------------------
+
+                ready_count = 0
+
+                for candles in completed_candles.values():
+
+                    if len(candles) >= 2:
+
+                        if candles[-1]["time"] == target_bucket:
+
+                            ready_count += 1
+
+
+                if (
+                    target_bucket > warmup_bucket
+                    and ready_count > 0
+                ):
+
+                    rebuild_top_results(
+                        target_bucket
+                    )
+
+            import time
+            time.sleep(1)
+
+        except Exception as e:
+
+            print(
+                "CANDLE ROTATION ERROR:",
+                str(e)
+            )
+
+            import time
+            time.sleep(2)
+
+
+# ============================================================
+# LIVE FEED CALLBACK
+# ============================================================
+
+def on_open():
+
+    global feed_connected
     global scan_status
-    global current_batch
-    global total_batches
-    global total_nse
-    global successful
-    global failed
+
+    feed_connected = True
+
+    scan_status = (
+        "Live Feed Connected | "
+        "Receiving NSE data..."
+    )
+
+    print("")
+    print("====================================")
+    print("UPSTOX LIVE FEED CONNECTED")
+    print(
+        "NSE INSTRUMENTS:",
+        total_nse
+    )
+    print("MODE: LTPC")
+    print("====================================")
+
+
+def on_message(message):
+
+    try:
+
+        if not isinstance(
+            message,
+            dict
+        ):
+
+            return
+
+
+        feeds = message.get(
+            "feeds",
+            {}
+        )
+
+
+        if not feeds:
+
+            return
+
+
+        with lock:
+
+            for key, feed in feeds.items():
+
+                symbol = symbol_by_key.get(
+                    key
+                )
+
+                if not symbol:
+
+                    continue
+
+
+                ltpc = feed.get(
+                    "ltpc"
+                )
+
+
+                if not ltpc:
+
+                    continue
+
+
+                ltp = ltpc.get(
+                    "ltp"
+                )
+
+                ltq = ltpc.get(
+                    "ltq",
+                    0
+                )
+
+                ltt = ltpc.get(
+                    "ltt"
+                )
+
+
+                if (
+                    ltp is None
+                    or ltt is None
+                ):
+
+                    continue
+
+
+                process_trade(
+                    key,
+                    ltp,
+                    ltq,
+                    ltt
+                )
+
+    except Exception as e:
+
+        print(
+            "MESSAGE ERROR:",
+            str(e)
+        )
+
+
+def on_error(error):
+
+    global feed_connected
+    global scan_status
+
+    feed_connected = False
+
+    scan_status = (
+        "Live Feed Error - reconnecting..."
+    )
+
+    print(
+        "UPSTOX FEED ERROR:",
+        str(error)
+    )
+
+
+def on_close(
+    close_code,
+    close_message
+):
+
+    global feed_connected
+    global scan_status
+
+    feed_connected = False
+
+    scan_status = (
+        "Live Feed Disconnected - reconnecting..."
+    )
+
+    print(
+        "UPSTOX FEED CLOSED:",
+        close_code,
+        close_message
+    )
+
+    # Do not carry partial candle volume
+    # across a disconnected connection.
+    reset_live_data()
+
+
+# ============================================================
+# START UPSTOX LIVE FEED
+# ============================================================
+
+def start_live_feed():
+
+    global streamer
+    global scan_status
+
+    try:
+
+        if not instrument_keys:
+
+            scan_status = (
+                "ERROR: NSE instruments not loaded"
+            )
+
+            return
+
+
+        configuration = (
+            upstox_client.Configuration()
+        )
+
+        configuration.access_token = (
+            ACCESS_TOKEN
+        )
+
+
+        api_client = (
+            upstox_client.ApiClient(
+                configuration
+            )
+        )
+
+
+        print("")
+        print("====================================")
+        print("STARTING MARKET DATA STREAMER V3")
+        print(
+            "SUBSCRIBING:",
+            len(instrument_keys),
+            "NSE EQUITY SHARES"
+        )
+        print("MODE: LTPC")
+        print("====================================")
+
+
+        streamer = (
+            upstox_client.MarketDataStreamerV3(
+                api_client,
+                instrument_keys,
+                "ltpc"
+            )
+        )
+
+
+        streamer.on(
+            "open",
+            on_open
+        )
+
+        streamer.on(
+            "message",
+            on_message
+        )
+
+        streamer.on(
+            "error",
+            on_error
+        )
+
+        streamer.on(
+            "close",
+            on_close
+        )
+
+
+        # Allow automatic reconnection.
+        streamer.auto_reconnect(
+            True,
+            5,
+            999999
+        )
+
+
+        streamer.connect()
+
+
+    except Exception as e:
+
+        scan_status = (
+            "LIVE FEED START ERROR"
+        )
+
+        print(
+            "LIVE FEED START ERROR:",
+            str(e)
+        )
+
+
+# ============================================================
+# SCANNER STARTER
+# ============================================================
+
+def start_scanner():
+
+    global scan_status
+
+    if not ACCESS_TOKEN:
+
+        scan_status = (
+            "ERROR: UPSTOX_ACCESS_TOKEN missing"
+        )
+
+        print(scan_status)
+
+        return
+
 
     stocks = load_nse_equities()
+
 
     if not stocks:
 
@@ -455,171 +1108,27 @@ def scanner():
             "ERROR: NSE instruments not loaded"
         )
 
-        print(scan_status)
-
         return
 
-    total_nse = len(stocks)
 
-    total_batches = (
-        (total_nse + BATCH_SIZE - 1)
-        // BATCH_SIZE
+    reset_live_data()
+
+
+    # Candle rotation thread
+    rotation_thread = threading.Thread(
+        target=rotate_candles,
+        daemon=True
     )
 
-    print("")
-    print("====================================")
-    print("FULL NSE SCANNER STARTED")
-    print("NSE EQUITY:", total_nse)
-    print("BATCH SIZE:", BATCH_SIZE)
-    print("TOTAL BATCHES:", total_batches)
-    print("TIMEFRAME: 5 MINUTES")
-    print("TOP RESULTS:", TOP_RESULTS)
-    print("====================================")
+    rotation_thread.start()
 
-    batch_index = 0
 
-    # Keep scanning forever
-    while True:
-
-        try:
-
-            current_batch = batch_index
-
-            # Reset counters at beginning of
-            # a complete market rotation
-            if batch_index == 0:
-
-                successful = 0
-                failed = 0
-
-                print("")
-                print(
-                    "========== NEW FULL NSE ROTATION =========="
-                )
-
-            batch_signals = scan_batch(
-                stocks,
-                batch_index
-            )
-
-            # ------------------------------------------------
-            # Add/update signals
-            # ------------------------------------------------
-
-            with lock:
-
-                # Add new signals to existing list
-                for signal in batch_signals:
-
-                    results = [
-                        old
-                        for old in results
-                        if old["symbol"]
-                        != signal["symbol"]
-                    ]
-
-                    results.append(
-                        signal
-                    )
-
-                # Sort strongest volume jump first
-                results.sort(
-                    key=lambda x: x["jump"],
-                    reverse=True
-                )
-
-                # Keep only TOP 10
-                results = results[:TOP_RESULTS]
-
-                # Save back
-                globals()["results"] = results
-
-                last_scan_time = (
-                    now_ist().strftime(
-                        "%d-%m-%Y %H:%M:%S"
-                    )
-                )
-
-                scan_status = (
-                    f"Scanning NSE | "
-                    f"Batch {batch_index + 1}/"
-                    f"{total_batches} | "
-                    f"Signals stored: "
-                    f"{len(results)}"
-                )
-
-            print("")
-            print(
-                "BATCH COMPLETE:",
-                batch_index + 1,
-                "/",
-                total_batches
-            )
-
-            print(
-                "Signals stored:",
-                len(results)
-            )
-
-            # ------------------------------------------------
-            # Next batch
-            # ------------------------------------------------
-
-            batch_index += 1
-
-            if batch_index >= total_batches:
-
-                print("")
-                print(
-                    "===================================="
-                )
-                print(
-                    "FULL NSE ROTATION COMPLETE"
-                )
-                print(
-                    "Successful:",
-                    successful
-                )
-                print(
-                    "Failed:",
-                    failed
-                )
-                print(
-                    "Top Signals:",
-                    len(results)
-                )
-                print(
-                    "===================================="
-                )
-
-                batch_index = 0
-
-                # Wait before starting new rotation
-                time.sleep(
-                    BATCH_WAIT
-                )
-
-            else:
-
-                # Small pause between batches
-                time.sleep(2)
-
-        except Exception as e:
-
-            print(
-                "SCANNER ERROR:",
-                str(e)
-            )
-
-            scan_status = (
-                "Scanner error - retrying"
-            )
-
-            time.sleep(10)
+    # Live market feed
+    start_live_feed()
 
 
 # ============================================================
-# WEBSITE
+# WEBSITE HTML
 # ============================================================
 
 HTML = """
@@ -646,69 +1155,106 @@ HTML = """
 <style>
 
 body {
+
     font-family: Arial, sans-serif;
+
     background: #f5f5f5;
+
     margin: 0;
+
     padding: 15px;
 }
 
 .container {
+
     max-width: 1000px;
+
     margin: auto;
 }
 
 h1 {
+
     text-align: center;
+
     margin-bottom: 5px;
 }
 
 .subtitle {
+
     text-align: center;
+
     color: #666;
+
     margin-bottom: 15px;
 }
 
 .status {
+
     background: white;
-    padding: 12px;
+
+    padding: 14px;
+
     border-radius: 8px;
+
     margin-bottom: 15px;
-    box-shadow: 0 1px 5px rgba(0,0,0,0.1);
+
+    box-shadow:
+        0 1px 5px
+        rgba(0,0,0,0.1);
 }
 
 table {
+
     width: 100%;
+
     border-collapse: collapse;
+
     background: white;
+
     border-radius: 8px;
+
     overflow: hidden;
 }
 
 th {
+
     background: #222;
+
     color: white;
+
     padding: 10px;
 }
 
 td {
+
     padding: 10px;
+
     text-align: center;
-    border-bottom: 1px solid #ddd;
+
+    border-bottom:
+        1px solid #ddd;
 }
 
 .signal {
+
     font-weight: bold;
 }
 
 .no-signal {
+
     text-align: center;
+
     padding: 25px;
+
     background: white;
+
     border-radius: 8px;
 }
 
 .small {
+
     color: #666;
+
     font-size: 13px;
 }
 
@@ -716,15 +1262,23 @@ td {
 
 </head>
 
+
 <body>
 
 <div class="container">
 
-<h1>RedVol5M</h1>
+
+<h1>
+RedVol5M
+</h1>
+
 
 <div class="subtitle">
+
 FULL NSE • 5-MINUTE SCANNER • TOP 10
+
 </div>
+
 
 <div class="status">
 
@@ -738,29 +1292,44 @@ FULL NSE • 5-MINUTE SCANNER • TOP 10
 
 <br><br>
 
+<b>Last Completed Candle:</b>
+{{ last_candle }}
+
+<br><br>
+
 <b>NSE Equity:</b>
 {{ total_nse }}
 
 <br><br>
 
-<b>Current Batch:</b>
-{{ current_batch }} / {{ total_batches }}
+<b>Feed:</b>
+{{ feed_status }}
 
 </div>
+
 
 {% if results %}
 
 <table>
 
 <tr>
+
 <th>Rank</th>
+
 <th>Symbol</th>
+
 <th>Price</th>
+
 <th>Volume</th>
+
 <th>Previous Volume</th>
+
 <th>Jump</th>
+
 <th>Candle</th>
+
 </tr>
+
 
 {% for item in results %}
 
@@ -770,25 +1339,31 @@ FULL NSE • 5-MINUTE SCANNER • TOP 10
 {{ loop.index }}
 </td>
 
+
 <td class="signal">
 {{ item.symbol }}
 </td>
+
 
 <td>
 ₹{{ item.price }}
 </td>
 
+
 <td>
 {{ "{:,}".format(item.volume) }}
 </td>
+
 
 <td>
 {{ "{:,}".format(item.previous_volume) }}
 </td>
 
+
 <td class="signal">
 {{ item.jump }} X
 </td>
+
 
 <td>
 {{ item.time }}
@@ -800,27 +1375,38 @@ FULL NSE • 5-MINUTE SCANNER • TOP 10
 
 </table>
 
+
 {% else %}
 
 <div class="no-signal">
 
-<b>No Signal Found</b>
+<b>
+No Signal Found
+</b>
 
 <br><br>
 
 <span class="small">
-Scanner is checking NSE shares in batches.
+
+Scanner is building fresh 5-minute candles
+from the live NSE market feed.
+
 </span>
 
 </div>
 
 {% endif %}
 
+
 <br>
 
+
 <div class="small">
+
 Page automatically refreshes every 30 seconds.
+
 </div>
+
 
 </div>
 
@@ -829,6 +1415,10 @@ Page automatically refreshes every 30 seconds.
 </html>
 """
 
+
+# ============================================================
+# WEBSITE ROUTE
+# ============================================================
 
 @app.route("/")
 def home():
@@ -839,41 +1429,49 @@ def home():
             results
         )
 
-        current_status = scan_status
+        current_status = (
+            scan_status
+        )
 
         current_last_scan = (
             last_scan_time
         )
 
-        current_nse = total_nse
-
-        if total_batches > 0:
-
-            current_batch_display = (
-                current_batch + 1
-            )
-
-        else:
-
-            current_batch_display = 0
-
-        current_total_batches = (
-            total_batches
+        current_last_candle = (
+            last_completed_candle
         )
 
+        current_nse = (
+            total_nse
+        )
+
+        current_feed = (
+            "CONNECTED"
+            if feed_connected
+            else "DISCONNECTED"
+        )
+
+
     return render_template_string(
+
         HTML,
+
         results=current_results,
+
         status=current_status,
+
         last_scan=current_last_scan,
+
+        last_candle=current_last_candle,
+
         total_nse=current_nse,
-        current_batch=current_batch_display,
-        total_batches=current_total_batches
+
+        feed_status=current_feed
     )
 
 
 # ============================================================
-# START
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
@@ -887,21 +1485,28 @@ if __name__ == "__main__":
         )
         print("")
 
+        scan_status = (
+            "ERROR: UPSTOX_ACCESS_TOKEN missing"
+        )
+
     else:
 
         if not scanner_started:
 
             scanner_started = True
 
-            thread = threading.Thread(
-                target=scanner,
+            scanner_thread = threading.Thread(
+                target=start_scanner,
                 daemon=True
             )
 
-            thread.start()
+            scanner_thread.start()
+
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
             os.environ.get(
                 "PORT",
