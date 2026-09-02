@@ -1,83 +1,92 @@
 import os
 import time
-import json
 import gzip
+import json
 import threading
-import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
-from flask import Flask
+import requests
+from flask import Flask, render_template_string
 
+# ============================================================
+# REDVOL5M - FULL NSE 5-MINUTE SCANNER
+# ============================================================
 
 app = Flask(__name__)
 
-
-# =========================================================
-# UPSTOX SETTINGS
-# =========================================================
-
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
-
-BASE_URL = "https://api.upstox.com"
+ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
 
 INSTRUMENT_URL = (
-    "https://assets.upstox.com/"
-    "market-quote/instruments/exchange/"
-    "complete.json.gz"
+    "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 )
 
-HEADERS = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {ACCESS_TOKEN}"
-}
+API_BASE = "https://api.upstox.com"
 
+# -----------------------------
+# SCANNER SETTINGS
+# -----------------------------
 
-# =========================================================
-# OUR 5 STOCKS
-# =========================================================
+TIMEFRAME = 5
 
-TARGET_SYMBOLS = [
-    "YATRA",
-    "RAIN",
-    "ITC",
-    "GARUDA",
-    "TARC"
-]
+# Maximum signals shown on website
+TOP_RESULTS = 10
 
+# Upstox limit is 500/min.
+# Keep our scanner comfortably below that.
+BATCH_SIZE = 400
 
-stocks = []
+# Small gap between requests
+REQUEST_DELAY = 0.12
 
+# Wait before starting the next full-market batch
+BATCH_WAIT = 60
 
-# =========================================================
-# SCANNER STATE
-# =========================================================
+# Minimum share price
+MIN_PRICE = 50
+
+# -----------------------------
+# GLOBAL VARIABLES
+# -----------------------------
 
 results = []
 
+lock = threading.Lock()
+
 last_scan_time = "Not scanned yet"
+
+scan_status = "Starting scanner..."
+
+total_nse = 0
+current_batch = 0
+total_batches = 0
 
 successful = 0
 failed = 0
 
-scan_status = "Scanner starting..."
-
-lock = threading.Lock()
+scanner_started = False
 
 
-# =========================================================
-# LOAD INSTRUMENT KEYS
-# =========================================================
+# ============================================================
+# INDIA TIME
+# ============================================================
 
-def load_target_stocks():
+IST = timezone(timedelta(hours=5, minutes=30))
 
-    global stocks
+
+def now_ist():
+    return datetime.now(IST)
+
+
+# ============================================================
+# LOAD NSE EQUITY INSTRUMENTS
+# ============================================================
+
+def load_nse_equities():
+
+    print("Loading NSE instruments...")
 
     try:
-
-        print("Loading NSE instruments...")
-
         response = requests.get(
             INSTRUMENT_URL,
             timeout=30
@@ -85,85 +94,64 @@ def load_target_stocks():
 
         response.raise_for_status()
 
-        raw = response.content
+        data = gzip.decompress(response.content)
 
-        if raw[:2] == b"\x1f\x8b":
-            raw = gzip.decompress(raw)
-
-        data = json.loads(
-            raw.decode("utf-8")
-        )
+        instruments = json.loads(data.decode("utf-8"))
 
         stocks = []
 
-        target_set = set(TARGET_SYMBOLS)
+        for item in instruments:
 
-        for item in data:
+            try:
 
-            if (
-                item.get("segment") == "NSE_EQ"
-                and item.get("instrument_type") == "EQ"
-                and item.get("security_type") == "NORMAL"
-            ):
+                if item.get("segment") != "NSE_EQ":
+                    continue
 
-                symbol = item.get("trading_symbol")
+                if item.get("instrument_type") != "EQ":
+                    continue
+
+                trading_symbol = item.get("trading_symbol")
                 instrument_key = item.get("instrument_key")
 
-                if (
-                    symbol in target_set
-                    and instrument_key
-                ):
+                if not trading_symbol or not instrument_key:
+                    continue
 
-                    stocks.append(
-                        {
-                            "name": symbol,
-                            "key": instrument_key
-                        }
-                    )
+                stocks.append(
+                    {
+                        "symbol": trading_symbol,
+                        "instrument_key": instrument_key
+                    }
+                )
 
-        print(
-            "Target stocks loaded:",
-            len(stocks)
-        )
+            except Exception:
+                continue
+
+        # Remove duplicate symbols
+        unique = {}
 
         for stock in stocks:
+            unique[stock["symbol"]] = stock
 
-            print(
-                stock["name"],
-                "=>",
-                stock["key"]
-            )
+        stocks = list(unique.values())
 
-        missing = [
-            symbol
-            for symbol in TARGET_SYMBOLS
-            if symbol not in [
-                x["name"] for x in stocks
-            ]
-        ]
+        stocks.sort(key=lambda x: x["symbol"])
 
-        if missing:
+        print("====================================")
+        print("TOTAL NSE EQUITY LOADED:", len(stocks))
+        print("====================================")
 
-            print(
-                "Missing symbols:",
-                missing
-            )
-
-        return True
+        return stocks
 
     except Exception as e:
 
-        print(
-            "Instrument loading error:",
-            e
-        )
+        print("INSTRUMENT LOAD ERROR:", str(e))
 
-        return False
+        return []
 
 
-# =========================================================
-# GET 5 MINUTE CANDLES
-# =========================================================
+# ============================================================
+# GET 5-MINUTE CANDLES
+# ============================================================
 
 def get_candles(instrument_key):
 
@@ -173,566 +161,751 @@ def get_candles(instrument_key):
     )
 
     url = (
-        BASE_URL
-        + "/v3/historical-candle/intraday/"
-        + encoded_key
-        + "/minutes/5"
+        f"{API_BASE}/v3/historical-candle/intraday/"
+        f"{encoded_key}/minutes/5"
     )
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
 
     try:
 
         response = requests.get(
             url,
-            headers=HEADERS,
-            timeout=15
+            headers=headers,
+            timeout=10
         )
 
         if response.status_code != 200:
 
-            print(
-                "API error:",
-                response.status_code
-            )
-
             return None
 
-        body = response.json()
+        data = response.json()
 
         candles = (
-            body
-            .get("data", {})
-            .get("candles", [])
+            data.get("data", {})
+                .get("candles", [])
         )
+
+        if not candles:
+            return None
 
         return candles
 
-    except Exception as e:
-
-        print(
-            "Candle error:",
-            e
-        )
+    except Exception:
 
         return None
 
 
-# =========================================================
-# GET LAST COMPLETED 5-MINUTE CANDLES
-# =========================================================
+# ============================================================
+# FIND LATEST COMPLETED 5-MINUTE CANDLE
+# ============================================================
 
 def get_completed_candles(candles):
 
-    if not candles:
+    completed = []
 
-        return None, None
+    current_time = now_ist()
 
-    try:
+    # Current 5-minute candle start
+    minute = (current_time.minute // 5) * 5
 
-        rows = []
+    current_bucket = current_time.replace(
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
 
-        for candle in candles:
+    for candle in candles:
 
-            if len(candle) < 6:
-                continue
+        if len(candle) < 6:
+            continue
+
+        try:
+
+            timestamp = candle[0]
 
             candle_time = datetime.fromisoformat(
-                candle[0].replace("Z", "+00:00")
+                timestamp
             )
 
-            rows.append(
-                {
-                    "time": candle_time,
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4]),
-                    "volume": int(candle[5])
-                }
+            # Make timezone aware if necessary
+            if candle_time.tzinfo is None:
+                candle_time = candle_time.replace(
+                    tzinfo=IST
+                )
+
+            # Only COMPLETED candles
+            if candle_time < current_bucket:
+
+                completed.append(
+                    {
+                        "time": candle_time,
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4]),
+                        "volume": float(candle[5])
+                    }
+                )
+
+        except Exception:
+            continue
+
+    completed.sort(
+        key=lambda x: x["time"]
+    )
+
+    return completed
+
+
+# ============================================================
+# CHECK USER'S SIGNAL CONDITIONS
+# ============================================================
+
+def check_signal(symbol, candles):
+
+    completed = get_completed_candles(candles)
+
+    if len(completed) < 2:
+        return None
+
+    previous = completed[-2]
+    current = completed[-1]
+
+    previous_open = previous["open"]
+    previous_close = previous["close"]
+
+    current_open = current["open"]
+    current_close = current["close"]
+
+    previous_volume = previous["volume"]
+    current_volume = current["volume"]
+
+    # --------------------------------------------------------
+    # CONDITIONS
+    #
+    # 1. Previous candle GREEN
+    # 2. Current completed candle RED
+    # 3. Current volume > previous volume
+    # 4. Price >= Rs 50
+    # --------------------------------------------------------
+
+    previous_green = (
+        previous_close > previous_open
+    )
+
+    current_red = (
+        current_close < current_open
+    )
+
+    volume_higher = (
+        current_volume > previous_volume
+    )
+
+    price_condition = (
+        current_close >= MIN_PRICE
+    )
+
+    if not previous_green:
+        return None
+
+    if not current_red:
+        return None
+
+    if not volume_higher:
+        return None
+
+    if not price_condition:
+        return None
+
+    # Volume jump
+    if previous_volume > 0:
+
+        jump = (
+            current_volume /
+            previous_volume
+        )
+
+    else:
+
+        jump = 0
+
+    return {
+        "symbol": symbol,
+        "price": round(current_close, 2),
+        "volume": int(current_volume),
+        "previous_volume": int(previous_volume),
+        "jump": round(jump, 2),
+        "time": current["time"].strftime(
+            "%H:%M"
+        )
+    }
+
+
+# ============================================================
+# SCAN ONE BATCH
+# ============================================================
+
+def scan_batch(stocks, batch_number):
+
+    global successful
+    global failed
+
+    temp_signals = []
+
+    start = (
+        batch_number * BATCH_SIZE
+    )
+
+    end = min(
+        start + BATCH_SIZE,
+        len(stocks)
+    )
+
+    batch = stocks[start:end]
+
+    print("")
+    print("====================================")
+    print(
+        f"SCANNING BATCH "
+        f"{batch_number + 1}/{total_batches}"
+    )
+    print(
+        f"Stocks: {start + 1} - {end}"
+    )
+    print("====================================")
+
+    batch_success = 0
+    batch_failed = 0
+
+    for stock in batch:
+
+        symbol = stock["symbol"]
+
+        candles = get_candles(
+            stock["instrument_key"]
+        )
+
+        if candles is None:
+
+            batch_failed += 1
+
+            time.sleep(
+                REQUEST_DELAY
             )
 
-        if len(rows) < 2:
+            continue
 
-            return None, None
+        batch_success += 1
 
-        rows.sort(
-            key=lambda x: x["time"]
+        signal = check_signal(
+            symbol,
+            candles
         )
 
-        now = datetime.now(
-            ZoneInfo("Asia/Kolkata")
+        if signal is not None:
+
+            temp_signals.append(
+                signal
+            )
+
+            print(
+                "SIGNAL:",
+                symbol,
+                "| Price:",
+                signal["price"],
+                "| Jump:",
+                signal["jump"],
+                "X"
+            )
+
+        time.sleep(
+            REQUEST_DELAY
         )
 
-        current_bucket = now.replace(
-            minute=(now.minute // 5) * 5,
-            second=0,
-            microsecond=0
-        )
+    successful += batch_success
+    failed += batch_failed
 
-        # Only COMPLETED candles are used.
-        last_completed_time = (
-            current_bucket
-            - timedelta(minutes=5)
-        )
-
-        completed = [
-            row
-            for row in rows
-            if row["time"] <= last_completed_time
-        ]
-
-        if len(completed) < 2:
-
-            return None, None
-
-        current = completed[-1]
-
-        previous = completed[-2]
-
-        return current, previous
-
-    except Exception as e:
-
-        print(
-            "Candle processing error:",
-            e
-        )
-
-        return None, None
+    return temp_signals
 
 
-# =========================================================
-# SCAN MARKET
-# =========================================================
+# ============================================================
+# MAIN SCANNER
+# ============================================================
 
-def scan_market():
+def scanner():
 
     global results
     global last_scan_time
+    global scan_status
+    global current_batch
+    global total_batches
+    global total_nse
     global successful
     global failed
-    global scan_status
 
+    stocks = load_nse_equities()
+
+    if not stocks:
+
+        scan_status = (
+            "ERROR: NSE instruments not loaded"
+        )
+
+        print(scan_status)
+
+        return
+
+    total_nse = len(stocks)
+
+    total_batches = (
+        (total_nse + BATCH_SIZE - 1)
+        // BATCH_SIZE
+    )
+
+    print("")
+    print("====================================")
+    print("FULL NSE SCANNER STARTED")
+    print("NSE EQUITY:", total_nse)
+    print("BATCH SIZE:", BATCH_SIZE)
+    print("TOTAL BATCHES:", total_batches)
+    print("TIMEFRAME: 5 MINUTES")
+    print("TOP RESULTS:", TOP_RESULTS)
+    print("====================================")
+
+    batch_index = 0
+
+    # Keep scanning forever
     while True:
 
-        temp = []
+        try:
 
-        successful_count = 0
-        failed_count = 0
+            current_batch = batch_index
 
-        print(
-            "----- NEW SCAN STARTED -----"
-        )
+            # Reset counters at beginning of
+            # a complete market rotation
+            if batch_index == 0:
 
-        for stock in stocks:
+                successful = 0
+                failed = 0
 
-            candles = get_candles(
-                stock["key"]
+                print("")
+                print(
+                    "========== NEW FULL NSE ROTATION =========="
+                )
+
+            batch_signals = scan_batch(
+                stocks,
+                batch_index
             )
 
-            if candles is None:
+            # ------------------------------------------------
+            # Add/update signals
+            # ------------------------------------------------
 
-                failed_count += 1
+            with lock:
 
-                continue
+                # Add new signals to existing list
+                for signal in batch_signals:
 
-            current, previous = (
-                get_completed_candles(candles)
-            )
+                    results = [
+                        old
+                        for old in results
+                        if old["symbol"]
+                        != signal["symbol"]
+                    ]
 
-            if (
-                current is None
-                or previous is None
-            ):
-
-                failed_count += 1
-
-                continue
-
-            successful_count += 1
-
-            try:
-
-                price = current["close"]
-
-                # Price filter
-                if price < 50:
-
-                    continue
-
-                # Previous candle GREEN
-                previous_green = (
-                    previous["close"]
-                    >
-                    previous["open"]
-                )
-
-                # Current candle RED
-                current_red = (
-                    current["close"]
-                    <
-                    current["open"]
-                )
-
-                # Volume jump
-                volume_jump = (
-                    current["volume"]
-                    -
-                    previous["volume"]
-                )
-
-                # =================================================
-                # SIGNAL CONDITION
-                # =================================================
-
-                if (
-                    previous_green
-                    and
-                    current_red
-                    and
-                    current["volume"]
-                    >
-                    previous["volume"]
-                ):
-
-                    temp.append(
-                        {
-                            "symbol": stock["name"],
-                            "price": round(
-                                price,
-                                2
-                            ),
-                            "volume": current[
-                                "volume"
-                            ],
-                            "previous_volume": previous[
-                                "volume"
-                            ],
-                            "jump": volume_jump,
-                            "time": current[
-                                "time"
-                            ].astimezone(
-                                ZoneInfo(
-                                    "Asia/Kolkata"
-                                )
-                            ).strftime(
-                                "%H:%M"
-                            )
-                        }
+                    results.append(
+                        signal
                     )
 
-            except Exception as e:
+                # Sort strongest volume jump first
+                results.sort(
+                    key=lambda x: x["jump"],
+                    reverse=True
+                )
 
-                failed_count += 1
+                # Keep only TOP 10
+                results = results[:TOP_RESULTS]
 
+                # Save back
+                globals()["results"] = results
+
+                last_scan_time = (
+                    now_ist().strftime(
+                        "%d-%m-%Y %H:%M:%S"
+                    )
+                )
+
+                scan_status = (
+                    f"Scanning NSE | "
+                    f"Batch {batch_index + 1}/"
+                    f"{total_batches} | "
+                    f"Signals stored: "
+                    f"{len(results)}"
+                )
+
+            print("")
+            print(
+                "BATCH COMPLETE:",
+                batch_index + 1,
+                "/",
+                total_batches
+            )
+
+            print(
+                "Signals stored:",
+                len(results)
+            )
+
+            # ------------------------------------------------
+            # Next batch
+            # ------------------------------------------------
+
+            batch_index += 1
+
+            if batch_index >= total_batches:
+
+                print("")
                 print(
-                    "Stock processing error:",
-                    stock["name"],
-                    e
+                    "===================================="
+                )
+                print(
+                    "FULL NSE ROTATION COMPLETE"
+                )
+                print(
+                    "Successful:",
+                    successful
+                )
+                print(
+                    "Failed:",
+                    failed
+                )
+                print(
+                    "Top Signals:",
+                    len(results)
+                )
+                print(
+                    "===================================="
                 )
 
-        # =========================================================
-        # UPDATE RESULTS
-        # =========================================================
+                batch_index = 0
 
-        temp.sort(
-            key=lambda x: x["jump"],
-            reverse=True
-        )
-
-        with lock:
-
-            results = temp
-
-            successful = successful_count
-
-            failed = failed_count
-
-            last_scan_time = (
-                datetime.now(
-                    ZoneInfo("Asia/Kolkata")
-                ).strftime(
-                    "%d-%m-%Y %H:%M:%S"
+                # Wait before starting new rotation
+                time.sleep(
+                    BATCH_WAIT
                 )
+
+            else:
+
+                # Small pause between batches
+                time.sleep(2)
+
+        except Exception as e:
+
+            print(
+                "SCANNER ERROR:",
+                str(e)
             )
 
             scan_status = (
-                "Scan complete | "
-                f"Checked: {successful} | "
-                f"Failed: {failed} | "
-                f"Signals: {len(results)}"
+                "Scanner error - retrying"
             )
 
-        print(
-            "SCAN COMPLETE | SIGNALS:",
-            len(results)
-        )
-
-        print(
-            "Successful:",
-            successful_count
-        )
-
-        print(
-            "Failed:",
-            failed_count
-        )
-
-        # Wait 60 seconds
-        time.sleep(60)
+            time.sleep(10)
 
 
-# =========================================================
-# WEB PAGE
-# =========================================================
+# ============================================================
+# WEBSITE
+# ============================================================
+
+HTML = """
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<meta
+    http-equiv="refresh"
+    content="30"
+>
+
+<title>RedVol5M - NSE Scanner</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    background: #f5f5f5;
+    margin: 0;
+    padding: 15px;
+}
+
+.container {
+    max-width: 1000px;
+    margin: auto;
+}
+
+h1 {
+    text-align: center;
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    text-align: center;
+    color: #666;
+    margin-bottom: 15px;
+}
+
+.status {
+    background: white;
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 15px;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.1);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+th {
+    background: #222;
+    color: white;
+    padding: 10px;
+}
+
+td {
+    padding: 10px;
+    text-align: center;
+    border-bottom: 1px solid #ddd;
+}
+
+.signal {
+    font-weight: bold;
+}
+
+.no-signal {
+    text-align: center;
+    padding: 25px;
+    background: white;
+    border-radius: 8px;
+}
+
+.small {
+    color: #666;
+    font-size: 13px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>RedVol5M</h1>
+
+<div class="subtitle">
+FULL NSE • 5-MINUTE SCANNER • TOP 10
+</div>
+
+<div class="status">
+
+<b>Status:</b>
+{{ status }}
+
+<br><br>
+
+<b>Last Scan:</b>
+{{ last_scan }}
+
+<br><br>
+
+<b>NSE Equity:</b>
+{{ total_nse }}
+
+<br><br>
+
+<b>Current Batch:</b>
+{{ current_batch }} / {{ total_batches }}
+
+</div>
+
+{% if results %}
+
+<table>
+
+<tr>
+<th>Rank</th>
+<th>Symbol</th>
+<th>Price</th>
+<th>Volume</th>
+<th>Previous Volume</th>
+<th>Jump</th>
+<th>Candle</th>
+</tr>
+
+{% for item in results %}
+
+<tr>
+
+<td class="signal">
+{{ loop.index }}
+</td>
+
+<td class="signal">
+{{ item.symbol }}
+</td>
+
+<td>
+₹{{ item.price }}
+</td>
+
+<td>
+{{ "{:,}".format(item.volume) }}
+</td>
+
+<td>
+{{ "{:,}".format(item.previous_volume) }}
+</td>
+
+<td class="signal">
+{{ item.jump }} X
+</td>
+
+<td>
+{{ item.time }}
+</td>
+
+</tr>
+
+{% endfor %}
+
+</table>
+
+{% else %}
+
+<div class="no-signal">
+
+<b>No Signal Found</b>
+
+<br><br>
+
+<span class="small">
+Scanner is checking NSE shares in batches.
+</span>
+
+</div>
+
+{% endif %}
+
+<br>
+
+<div class="small">
+Page automatically refreshes every 30 seconds.
+</div>
+
+</div>
+
+</body>
+
+</html>
+"""
+
 
 @app.route("/")
 def home():
 
     with lock:
 
-        current_results = list(results)
-
-        current_last_scan = last_scan_time
+        current_results = list(
+            results
+        )
 
         current_status = scan_status
 
-        current_successful = successful
+        current_last_scan = (
+            last_scan_time
+        )
 
-        current_failed = failed
+        current_nse = total_nse
 
-    html = f"""
-    <!DOCTYPE html>
+        if total_batches > 0:
 
-    <html>
+            current_batch_display = (
+                current_batch + 1
+            )
 
-    <head>
+        else:
 
-        <meta charset="UTF-8">
+            current_batch_display = 0
 
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1.0"
-        >
+        current_total_batches = (
+            total_batches
+        )
 
-        <meta
-            http-equiv="refresh"
-            content="30"
-        >
+    return render_template_string(
+        HTML,
+        results=current_results,
+        status=current_status,
+        last_scan=current_last_scan,
+        total_nse=current_nse,
+        current_batch=current_batch_display,
+        total_batches=current_total_batches
+    )
 
-        <title>RedVol5M Scanner</title>
 
-        <style>
-
-            body {{
-                font-family: Arial, sans-serif;
-                padding: 15px;
-                background: #111;
-                color: white;
-            }}
-
-            h1 {{
-                margin-bottom: 5px;
-            }}
-
-            .status {{
-                padding: 10px;
-                margin: 10px 0;
-                border: 1px solid #555;
-                border-radius: 6px;
-            }}
-
-            table {{
-                border-collapse: collapse;
-                width: 100%;
-                background: #222;
-            }}
-
-            th, td {{
-                border: 1px solid #555;
-                padding: 8px;
-                text-align: center;
-            }}
-
-            th {{
-                background: #333;
-            }}
-
-            .signal {{
-                font-weight: bold;
-            }}
-
-        </style>
-
-    </head>
-
-    <body>
-
-        <h1>RedVol5M Scanner</h1>
-
-        <h3>
-            5 Minute Volume Signal
-        </h3>
-
-        <div class="status">
-
-            <b>Scanner Status:</b>
-            {current_status}
-
-            <br><br>
-
-            <b>Last Scan:</b>
-            {current_last_scan}
-
-            <br><br>
-
-            <b>Stocks Checked:</b>
-            {current_successful}
-
-            &nbsp;&nbsp;
-
-            <b>Failed:</b>
-            {current_failed}
-
-        </div>
-
-    """
-
-    if not current_results:
-
-        html += """
-
-        <table>
-
-            <tr>
-
-                <th>Rank</th>
-                <th>Symbol</th>
-                <th>Price</th>
-                <th>Volume</th>
-                <th>Previous Volume</th>
-                <th>Jump</th>
-                <th>Time</th>
-
-            </tr>
-
-            <tr>
-
-                <td colspan="7">
-
-                    No Signal Found
-
-                </td>
-
-            </tr>
-
-        </table>
-
-        """
-
-    else:
-
-        html += """
-
-        <table>
-
-            <tr>
-
-                <th>Rank</th>
-                <th>Symbol</th>
-                <th>Price</th>
-                <th>Volume</th>
-                <th>Previous Volume</th>
-                <th>Jump</th>
-                <th>Time</th>
-
-            </tr>
-
-        """
-
-        for i, row in enumerate(
-            current_results,
-            1
-        ):
-
-            html += f"""
-
-            <tr class="signal">
-
-                <td>{i}</td>
-
-                <td>{row['symbol']}</td>
-
-                <td>{row['price']}</td>
-
-                <td>{row['volume']}</td>
-
-                <td>{row['previous_volume']}</td>
-
-                <td>{row['jump']}</td>
-
-                <td>{row['time']}</td>
-
-            </tr>
-
-            """
-
-        html += """
-
-        </table>
-
-        """
-
-    html += """
-
-        <p>
-            Page automatically refreshes every 30 seconds.
-        </p>
-
-    </body>
-
-    </html>
-
-    """
-
-    return html
-
-
-# =========================================================
-# START SERVER
-# =========================================================
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 
     if not ACCESS_TOKEN:
 
+        print("")
         print(
-            "ERROR: UPSTOX_ACCESS_TOKEN is not set."
+            "ERROR: UPSTOX_ACCESS_TOKEN "
+            "environment variable is missing."
         )
+        print("")
 
     else:
 
-        loaded = load_target_stocks()
+        if not scanner_started:
 
-        if loaded and stocks:
+            scanner_started = True
 
             thread = threading.Thread(
-                target=scan_market,
+                target=scanner,
                 daemon=True
             )
 
             thread.start()
 
-            print(
-                "----- NEW SCAN STARTED -----"
-            )
-
-        else:
-
-            print(
-                "No target stocks loaded."
-            )
-
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=int(
+            os.environ.get(
+                "PORT",
+                10000
+            )
+        )
     )
