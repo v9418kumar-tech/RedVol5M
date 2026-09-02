@@ -1,31 +1,57 @@
 import os
+import json
 import time
 import threading
-from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 import requests
-from flask import Flask, render_template_string
-
+from flask import Flask, request, render_template_string
 import upstox_client
 
 
 # =========================================================
-# CONFIG
+# SETTINGS
 # =========================================================
 
-ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+IST = ZoneInfo("Asia/Kolkata")
 
-INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/instruments/"
-    "exchange/complete.json.gz"
-)
+MIN_PRICE = 50
+TOP_N = 5
+CANDLE_MINUTES = 5
 
-MIN_PRICE = 50.0
-TOP_N = 10
-CANDLE_SECONDS = 5 * 60
+WATCHLIST_FILE = "watchlist.json"
 
-IST = timezone(timedelta(hours=5, minutes=30))
+DEFAULT_WATCHLIST = [
+    "YATRA",
+    "RAIN",
+    "TARC",
+    "GARUDA",
+    "ITC",
+    "EMIL",
+    "JAYKAY",
+    "ARIS",
+    "JTEKTINDIA",
+    "CENTENKA",
+    "EPACKPEB",
+    "ORIENTCEM",
+    "NITCO",
+    "BOROLTD",
+    "ETERNAL",
+    "PWL",
+    "MOL",
+    "YUKEN",
+    "MOIL",
+    "EIEL",
+    "IDEA",
+    "SANSTAR",
+    "VMM",
+    "TCC",
+    "MRPL",
+    "ORIENTHOT",
+    "PRABHA",
+]
 
 
 # =========================================================
@@ -36,727 +62,1167 @@ app = Flask(__name__)
 
 
 # =========================================================
-# GLOBAL SCANNER STATE
+# GLOBAL STATE
 # =========================================================
 
 state_lock = threading.RLock()
 
-instrument_map = {}
-instrument_keys = []
+watchlist = []
 
-current_candles = {}
-completed_candles = {}
+instrument_keys = {}
+valid_symbols = set()
+invalid_symbols = {}
 
-first_bucket_seen = set()
+candles = {}
+live_candles = {}
+last_tick_time = {}
+last_tick_seen = {}
 
-results = []
-
-feed_status = "STARTING"
-feed_error = ""
-
-last_tick_time = None
-last_completed_bucket = None
-
-tick_count = 0
-last_tick_count_log = 0
+signals = []
 
 streamer = None
+feed_status = "STARTING"
+feed_message = "Starting..."
+last_completed_candle = "Waiting for candles"
+
+scanner_started = False
 
 
 # =========================================================
-# LOGGING
+# WATCHLIST
 # =========================================================
 
-def log(message):
-    print(message, flush=True)
-
-
-# =========================================================
-# TIME HELPERS
-# =========================================================
-
-def now_ms():
-    return int(time.time() * 1000)
-
-
-def bucket_start_ms(ts_ms):
-    return (ts_ms // (CANDLE_SECONDS * 1000)) * (CANDLE_SECONDS * 1000)
-
-
-def format_bucket(ts_ms):
-    if not ts_ms:
-        return "Waiting for candles"
-
-    dt = datetime.fromtimestamp(ts_ms / 1000, tz=IST)
-    return dt.strftime("%d-%m-%Y %H:%M")
-
-
-def format_time(ts_ms):
-    if not ts_ms:
-        return "Waiting"
-
-    dt = datetime.fromtimestamp(ts_ms / 1000, tz=IST)
-    return dt.strftime("%H:%M:%S")
-
-
-# =========================================================
-# LOAD NSE EQUITY INSTRUMENTS
-# =========================================================
-
-def load_nse_equity_instruments():
-
-    global instrument_map
-    global instrument_keys
-    global feed_status
-    global feed_error
-
-    log("")
-    log("==============================================")
-    log("LOADING NSE EQUITY INSTRUMENTS")
-    log("==============================================")
-
-    if not ACCESS_TOKEN:
-        feed_status = "ERROR"
-        feed_error = "UPSTOX_ACCESS_TOKEN is missing"
-        log("ERROR: UPSTOX_ACCESS_TOKEN is missing")
-        return False
+def load_watchlist():
+    global watchlist
 
     try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-        log("Downloading Upstox instrument master...")
+            if isinstance(data, list):
+                cleaned = []
 
-        headers = {
-            "User-Agent": "RedVol5M/1.0",
-            "Accept": "application/json",
-        }
+                for x in data:
+                    symbol = str(x).strip().upper()
 
-        response = requests.get(
-            INSTRUMENT_URL,
-            headers=headers,
-            timeout=(10, 40),
+                    if symbol and symbol not in cleaned:
+                        cleaned.append(symbol)
+
+                if cleaned:
+                    watchlist = cleaned
+                    return
+
+    except Exception as e:
+        print("WATCHLIST LOAD ERROR:", e)
+
+    watchlist = DEFAULT_WATCHLIST.copy()
+    save_watchlist()
+
+
+def save_watchlist():
+    try:
+        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(watchlist, f, indent=2)
+    except Exception as e:
+        print("WATCHLIST SAVE ERROR:", e)
+
+
+# =========================================================
+# CANDLE HELPERS
+# =========================================================
+
+def candle_bucket(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+
+    dt = dt.astimezone(IST)
+
+    minute = (dt.minute // CANDLE_MINUTES) * CANDLE_MINUTES
+
+    return dt.replace(
+        minute=minute,
+        second=0,
+        microsecond=0
+    )
+
+
+def now_bucket():
+    return candle_bucket(datetime.now(IST))
+
+
+def bucket_label(bucket):
+    return bucket.strftime("%H:%M")
+
+
+# =========================================================
+# SYMBOL RUNTIME RESET
+# =========================================================
+
+def reset_runtime_for_symbol(symbol):
+    candles.pop(symbol, None)
+    live_candles.pop(symbol, None)
+    last_tick_time.pop(symbol, None)
+    last_tick_seen.pop(symbol, None)
+
+
+# =========================================================
+# UPSTOX INSTRUMENT SEARCH
+# =========================================================
+
+def instrument_search(symbol):
+    access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+
+    if not access_token:
+        raise RuntimeError("UPSTOX_ACCESS_TOKEN is missing")
+
+    url = "https://api.upstox.com/v2/instruments/search"
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    params = {
+        "query": symbol,
+        "exchanges": "NSE",
+        "segments": "EQ",
+        "instrument_types": "EQ",
+        "page_number": 1,
+        "records": 30,
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=15
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Instrument search HTTP {response.status_code}: "
+            f"{response.text[:300]}"
         )
 
-        log(f"Instrument HTTP status: {response.status_code}")
+    data = response.json()
 
-        response.raise_for_status()
+    records = data.get("data", [])
+
+    # Exact trading symbol match first
+    for item in records:
+        trading_symbol = str(
+            item.get("trading_symbol", "")
+        ).upper()
+
+        segment = str(
+            item.get("segment", "")
+        )
+
+        if trading_symbol == symbol.upper() and segment == "NSE_EQ":
+            return item
+
+    # Fallback: exact symbol even if segment field differs
+    for item in records:
+        trading_symbol = str(
+            item.get("trading_symbol", "")
+        ).upper()
+
+        if trading_symbol == symbol.upper():
+            return item
+
+    return None
+
+
+# =========================================================
+# RESOLVE ALL WATCHLIST SYMBOLS
+# =========================================================
+
+def resolve_watchlist():
+    global instrument_keys
+    global valid_symbols
+    global invalid_symbols
+
+    print("========================================")
+    print("RESOLVING PERSONAL WATCHLIST")
+    print("========================================")
+
+    with state_lock:
+        instrument_keys.clear()
+        valid_symbols.clear()
+        invalid_symbols.clear()
+
+    for symbol in list(watchlist):
+
+        try:
+            item = instrument_search(symbol)
+
+            if item:
+                key = item.get("instrument_key")
+
+                if key:
+                    with state_lock:
+                        instrument_keys[symbol] = key
+                        valid_symbols.add(symbol)
+
+                    print(
+                        f"VALID: {symbol} -> {key}"
+                    )
+
+                else:
+                    with state_lock:
+                        invalid_symbols[symbol] = "No instrument key"
+
+                    print(
+                        f"INVALID: {symbol} - no instrument key"
+                    )
+
+            else:
+                with state_lock:
+                    invalid_symbols[symbol] = "Symbol not found"
+
+                print(
+                    f"INVALID: {symbol} - not found"
+                )
+
+        except Exception as e:
+            with state_lock:
+                invalid_symbols[symbol] = str(e)
+
+            print(
+                f"ERROR resolving {symbol}: {e}"
+            )
+
+    print("----------------------------------------")
+    print(
+        f"Watchlist: {len(watchlist)} | "
+        f"Valid: {len(valid_symbols)} | "
+        f"Invalid: {len(invalid_symbols)}"
+    )
+    print("----------------------------------------")
+
+
+# =========================================================
+# INITIAL 5-MINUTE CANDLE SEED
+# =========================================================
+
+def fetch_initial_candles(symbol):
+    access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+
+    if not access_token:
+        return False
+
+    with state_lock:
+        key = instrument_keys.get(symbol)
+
+    if not key:
+        return False
+
+    encoded_key = quote(key, safe="")
+
+    url = (
+        "https://api.upstox.com/v3/historical-candle/"
+        f"intraday/{encoded_key}/minutes/5"
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            print(
+                f"HISTORY ERROR {symbol}: "
+                f"HTTP {response.status_code}"
+            )
+            return False
 
         data = response.json()
 
-        if not isinstance(data, list):
-            raise Exception(
-                f"Unexpected instrument master format: {type(data)}"
+        candles_data = data.get("data", {}).get(
+            "candles", []
+        )
+
+        if not candles_data:
+            print(
+                f"HISTORY EMPTY: {symbol}"
             )
+            return False
 
-        temp_map = {}
+        completed = []
 
-        for item in data:
+        current_bucket = now_bucket()
 
-            if not isinstance(item, dict):
+        for row in candles_data:
+
+            if len(row) < 6:
                 continue
 
-            if item.get("segment") != "NSE_EQ":
+            timestamp = row[0]
+            open_price = float(row[1])
+            high_price = float(row[2])
+            low_price = float(row[3])
+            close_price = float(row[4])
+            volume = float(row[5])
+
+            try:
+                dt = datetime.fromisoformat(
+                    str(timestamp).replace(
+                        "Z",
+                        "+00:00"
+                    )
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=IST)
+
+                dt = dt.astimezone(IST)
+
+            except Exception:
                 continue
 
-            if item.get("instrument_type") != "EQ":
+            bucket = candle_bucket(dt)
+
+            # Current candle is still forming, so do not seed it.
+            if bucket >= current_bucket:
                 continue
 
-            key = item.get("instrument_key")
-            symbol = item.get("trading_symbol")
+            completed.append({
+                "bucket": bucket,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+            })
 
-            if not key or not symbol:
-                continue
+        if not completed:
+            return False
 
-            temp_map[key] = {
-                "symbol": symbol,
-                "name": item.get("name", symbol),
-            }
-
-        if not temp_map:
-            raise Exception(
-                "NSE_EQ / EQ filtering returned zero instruments"
-            )
+        # Sort oldest -> newest
+        completed.sort(
+            key=lambda x: x["bucket"]
+        )
 
         with state_lock:
-            instrument_map = temp_map
-            instrument_keys = list(temp_map.keys())
+            candles[symbol] = completed[-10:]
 
-        log("")
-        log("==============================================")
-        log(f"NSE EQUITY LOADED: {len(instrument_keys)}")
-        log("==============================================")
-        log("")
+            # IMPORTANT:
+            # History exists, therefore the first live candle
+            # after startup must NOT be discarded.
+            live_candles.pop(symbol, None)
 
-        feed_status = "INSTRUMENTS LOADED"
+        print(
+            f"HISTORY OK: {symbol} "
+            f"({len(completed[-10:])} candles)"
+        )
 
         return True
 
-    except requests.exceptions.Timeout:
-        feed_status = "ERROR"
-        feed_error = "Instrument master download timed out"
-        log("ERROR: Instrument master download timed out")
-        return False
-
     except Exception as e:
-        feed_status = "ERROR"
-        feed_error = str(e)
-        log(f"ERROR: INSTRUMENT LOADING FAILED: {e}")
+        print(
+            f"HISTORY EXCEPTION {symbol}: {e}"
+        )
         return False
 
 
+def seed_all_symbols():
+    print("========================================")
+    print("LOADING INITIAL 5-MINUTE CANDLES")
+    print("========================================")
+
+    for symbol in list(valid_symbols):
+        fetch_initial_candles(symbol)
+
+    rebuild_signals()
+
+    print("INITIAL CANDLE SEED COMPLETE")
+
+
 # =========================================================
-# CANDLE FUNCTIONS
+# SIGNAL CALCULATION
 # =========================================================
 
-def finalize_candle(key, candle):
+def rebuild_signals():
+    global signals
 
-    global last_completed_bucket
-
-    bucket = candle["bucket"]
-
-    # First completed candle for this symbol is discarded.
-    # This avoids using a partial candle created before
-    # the live feed started.
-    if key not in first_bucket_seen:
-
-        first_bucket_seen.add(key)
-
-        log(
-            f"WARMUP: discarded first candle "
-            f"{format_bucket(bucket)} for "
-            f"{instrument_map.get(key, {}).get('symbol', key)}"
-        )
-
-        return
-
-    if candle["volume"] <= 0:
-        return
-
-    if key not in completed_candles:
-        completed_candles[key] = deque(maxlen=2)
-
-    completed_candles[key].append({
-        "bucket": bucket,
-        "open": candle["open"],
-        "high": candle["high"],
-        "low": candle["low"],
-        "close": candle["close"],
-        "volume": candle["volume"],
-    })
-
-    last_completed_bucket = bucket
-
-
-def rebuild_results(target_bucket):
-
-    global results
-
-    fresh = []
-
-    for key, candles in completed_candles.items():
-
-        if len(candles) < 2:
-            continue
-
-        previous = candles[-2]
-        current = candles[-1]
-
-        # Only use the latest completed candle pair.
-        if current["bucket"] != target_bucket:
-            continue
-
-        # Previous candle must be GREEN.
-        if previous["close"] <= previous["open"]:
-            continue
-
-        # Current candle must be RED.
-        if current["close"] >= current["open"]:
-            continue
-
-        # Current volume must be greater than previous volume.
-        if current["volume"] <= previous["volume"]:
-            continue
-
-        # Current price must be >= Rs 50.
-        if current["close"] < MIN_PRICE:
-            continue
-
-        if previous["volume"] <= 0:
-            continue
-
-        volume_jump = current["volume"] / previous["volume"]
-
-        symbol = instrument_map.get(key, {}).get("symbol", key)
-
-        fresh.append({
-            "symbol": symbol,
-            "price": current["close"],
-            "previous_volume": previous["volume"],
-            "volume": current["volume"],
-            "volume_jump": volume_jump,
-            "bucket": current["bucket"],
-        })
-
-    fresh.sort(
-        key=lambda x: x["volume_jump"],
-        reverse=True
-    )
-
-    results = fresh[:TOP_N]
-
-    log("")
-    log("==============================================")
-    log(
-        f"NEW 5-MINUTE SCAN: "
-        f"{format_bucket(target_bucket)}"
-    )
-    log(f"SIGNALS FOUND: {len(results)}")
-    log("==============================================")
-
-    for i, item in enumerate(results, start=1):
-
-        log(
-            f"{i}. {item['symbol']} | "
-            f"Price ₹{item['price']:.2f} | "
-            f"Volume Jump {item['volume_jump']:.2f}x"
-        )
-
-    if not results:
-        log("No signal found")
-
-    log("")
-
-
-def start_new_candle(key, bucket, price, volume):
-
-    current_candles[key] = {
-        "bucket": bucket,
-        "open": price,
-        "high": price,
-        "low": price,
-        "close": price,
-        "volume": volume,
-    }
-
-
-def process_trade(key, price, quantity, trade_time_ms):
-
-    global last_tick_time
-    global tick_count
-
-    if price <= 0:
-        return
-
-    bucket = bucket_start_ms(trade_time_ms)
-
-    quantity = max(0, quantity)
+    result = []
 
     with state_lock:
 
-        last_tick_time = trade_time_ms
-        tick_count += 1
+        for symbol in list(valid_symbols):
 
-        existing = current_candles.get(key)
+            history = candles.get(symbol, [])
 
-        if existing is None:
+            if len(history) < 2:
+                continue
 
-            start_new_candle(
-                key,
-                bucket,
-                price,
-                quantity
+            previous = history[-2]
+            current = history[-1]
+
+            prev_open = previous["open"]
+            prev_close = previous["close"]
+
+            cur_open = current["open"]
+            cur_close = current["close"]
+
+            prev_volume = previous["volume"]
+            cur_volume = current["volume"]
+
+            # -----------------------------
+            # CONDITIONS
+            # -----------------------------
+
+            # Previous completed candle GREEN
+            condition_previous_green = (
+                prev_close > prev_open
             )
 
-            return
-
-        # New 5-minute candle started.
-        if bucket > existing["bucket"]:
-
-            old_bucket = existing["bucket"]
-
-            finalize_candle(key, existing)
-
-            start_new_candle(
-                key,
-                bucket,
-                price,
-                quantity
+            # Latest completed candle RED
+            condition_current_red = (
+                cur_close < cur_open
             )
 
-            # Rebuild only after a completed candle.
-            if old_bucket == last_completed_bucket:
-                rebuild_results(old_bucket)
+            # Current volume greater than previous
+            condition_volume = (
+                cur_volume > prev_volume
+            )
 
-            return
+            # Price >= Rs 50
+            condition_price = (
+                cur_close >= MIN_PRICE
+            )
 
-        # Ignore very old/out-of-order ticks.
-        if bucket < existing["bucket"]:
-            return
+            if not (
+                condition_previous_green
+                and condition_current_red
+                and condition_volume
+                and condition_price
+            ):
+                continue
 
-        # Update current candle.
-        existing["high"] = max(
-            existing["high"],
-            price
+            if prev_volume <= 0:
+                continue
+
+            volume_jump = (
+                (cur_volume - prev_volume)
+                / prev_volume
+            ) * 100
+
+            result.append({
+                "symbol": symbol,
+                "price": cur_close,
+                "previous_volume": prev_volume,
+                "volume": cur_volume,
+                "volume_jump": volume_jump,
+                "candle_time": bucket_label(
+                    current["bucket"]
+                ),
+            })
+
+        result.sort(
+            key=lambda x: x["volume_jump"],
+            reverse=True
         )
 
-        existing["low"] = min(
-            existing["low"],
-            price
-        )
-
-        existing["close"] = price
-        existing["volume"] += quantity
+        signals = result[:TOP_N]
 
 
 # =========================================================
-# ROTATE CANDLES EVERY SECOND
+# LIVE TICK PROCESSING
 # =========================================================
 
-def rotate_candles_loop():
+def process_tick(symbol, ltp, ltq, ltt):
+    global last_completed_candle
 
-    global last_completed_bucket
+    if ltp is None:
+        return
 
-    log("CANDLE ROTATION THREAD STARTED")
+    try:
+        ltp = float(ltp)
+    except Exception:
+        return
+
+    try:
+        ltq = float(ltq or 0)
+    except Exception:
+        ltq = 0
+
+    # Convert timestamp
+    try:
+        if isinstance(ltt, (int, float)):
+            # Upstox LTT is generally epoch milliseconds
+            dt = datetime.fromtimestamp(
+                float(ltt) / 1000,
+                tz=IST
+            )
+        else:
+            dt = datetime.fromisoformat(
+                str(ltt).replace(
+                    "Z",
+                    "+00:00"
+                )
+            )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=IST)
+
+            dt = dt.astimezone(IST)
+
+    except Exception:
+        dt = datetime.now(IST)
+
+    bucket = candle_bucket(dt)
+
+    tick_key = (
+        f"{ltt}|"
+        f"{ltp}|"
+        f"{ltq}"
+    )
+
+    with state_lock:
+
+        # Duplicate tick protection
+        if last_tick_seen.get(symbol) == tick_key:
+            return
+
+        last_tick_seen[symbol] = tick_key
+
+        last_tick_time[symbol] = dt
+
+        old_live = live_candles.get(symbol)
+
+        # -------------------------------------------------
+        # NEW 5-MINUTE CANDLE
+        # -------------------------------------------------
+
+        if old_live is None:
+
+            live_candles[symbol] = {
+                "bucket": bucket,
+                "open": ltp,
+                "high": ltp,
+                "low": ltp,
+                "close": ltp,
+                "volume": ltq,
+            }
+
+            return
+
+        old_bucket = old_live["bucket"]
+
+        # -------------------------------------------------
+        # SAME 5-MINUTE CANDLE
+        # -------------------------------------------------
+
+        if bucket == old_bucket:
+
+            old_live["high"] = max(
+                old_live["high"],
+                ltp
+            )
+
+            old_live["low"] = min(
+                old_live["low"],
+                ltp
+            )
+
+            old_live["close"] = ltp
+
+            old_live["volume"] += ltq
+
+            return
+
+        # -------------------------------------------------
+        # NEW BUCKET = OLD CANDLE COMPLETED
+        # -------------------------------------------------
+
+        if bucket > old_bucket:
+
+            completed = dict(old_live)
+
+            if symbol not in candles:
+                candles[symbol] = []
+
+            candles[symbol].append(completed)
+
+            # Keep enough history
+            candles[symbol] = candles[symbol][-20:]
+
+            last_completed_candle = (
+                f"{bucket_label(old_bucket)} "
+                f"(completed)"
+            )
+
+            # Start new live candle
+            live_candles[symbol] = {
+                "bucket": bucket,
+                "open": ltp,
+                "high": ltp,
+                "low": ltp,
+                "close": ltp,
+                "volume": ltq,
+            }
+
+            # Recalculate immediately.
+            # Website refreshes every 2 seconds.
+            rebuild_signals()
+
+
+# =========================================================
+# ROTATE LOOP
+# =========================================================
+
+def rotate_loop():
+    global last_completed_candle
 
     while True:
 
         try:
-
-            current_bucket = bucket_start_ms(now_ms())
+            current_bucket = now_bucket()
 
             changed = False
-            newest_completed = None
 
             with state_lock:
 
-                for key in list(current_candles.keys()):
+                for symbol in list(
+                    live_candles.keys()
+                ):
 
-                    candle = current_candles.get(key)
+                    live = live_candles.get(symbol)
 
-                    if not candle:
+                    if not live:
                         continue
 
-                    if candle["bucket"] < current_bucket:
+                    live_bucket = live["bucket"]
 
-                        old_bucket = candle["bucket"]
+                    # If time has moved into a new
+                    # 5-minute candle, old candle is complete.
+                    if live_bucket < current_bucket:
 
-                        finalize_candle(
-                            key,
-                            candle
+                        completed = dict(live)
+
+                        if symbol not in candles:
+                            candles[symbol] = []
+
+                        candles[symbol].append(
+                            completed
                         )
 
-                        del current_candles[key]
+                        candles[symbol] = (
+                            candles[symbol][-20:]
+                        )
 
-                        if (
-                            old_bucket is not None
-                            and old_bucket == last_completed_bucket
-                        ):
-                            newest_completed = old_bucket
-                            changed = True
+                        live_candles.pop(
+                            symbol,
+                            None
+                        )
 
-                if changed and newest_completed is not None:
-                    rebuild_results(newest_completed)
+                        last_completed_candle = (
+                            f"{bucket_label(live_bucket)} "
+                            f"(completed)"
+                        )
 
-            time.sleep(1)
+                        changed = True
+
+            if changed:
+                rebuild_signals()
 
         except Exception as e:
-
-            log(
-                f"CANDLE ROTATION ERROR: {e}"
+            print(
+                "ROTATE ERROR:",
+                e
             )
 
-            time.sleep(2)
+        time.sleep(0.2)
 
 
 # =========================================================
 # UPSTOX LIVE FEED
 # =========================================================
 
-def start_live_feed():
-
+def start_feed():
     global streamer
     global feed_status
-    global feed_error
+    global feed_message
+
+    access_token = os.getenv(
+        "UPSTOX_ACCESS_TOKEN"
+    )
+
+    if not access_token:
+        feed_status = "ERROR"
+        feed_message = (
+            "UPSTOX_ACCESS_TOKEN missing"
+        )
+        print(feed_message)
+        return
 
     try:
 
-        log("")
-        log("==============================================")
-        log("STARTING UPSTOX LIVE MARKET DATA FEED")
-        log("==============================================")
-
-        configuration = upstox_client.Configuration()
-        configuration.access_token = ACCESS_TOKEN
-
-        api_client = upstox_client.ApiClient(
-            configuration
+        configuration = (
+            upstox_client.Configuration()
         )
 
-        # We intentionally create the streamer without
-        # initial keys and subscribe inside on_open.
-        # This follows Upstox's documented pattern.
+        configuration.access_token = (
+            access_token
+        )
 
-        streamer = upstox_client.MarketDataStreamerV3(
-            api_client
+        streamer = (
+            upstox_client.MarketDataStreamerV3(
+                upstox_client.ApiClient(
+                    configuration
+                )
+            )
         )
 
         def on_open():
-
             global feed_status
-            global feed_error
+            global feed_message
 
-            try:
-
-                log("")
-                log("==============================================")
-                log("UPSTOX LIVE FEED CONNECTED")
-                log("==============================================")
-                log(
-                    f"SUBSCRIBING TO "
-                    f"{len(instrument_keys)} NSE EQUITY INSTRUMENTS"
+            with state_lock:
+                keys = list(
+                    instrument_keys.values()
                 )
 
-                streamer.subscribe(
-                    instrument_keys,
-                    "ltpc"
-                )
+            feed_status = "CONNECTED"
+            feed_message = (
+                f"Subscribed to {len(keys)} instruments"
+            )
 
-                feed_status = "LIVE"
-                feed_error = ""
+            print(
+                "FEED CONNECTED"
+            )
 
-                log(
-                    "UPSTOX LIVE FEED SUBSCRIPTION SENT"
-                )
+            if keys:
+                try:
+                    streamer.subscribe(
+                        keys,
+                        "ltpc"
+                    )
 
-            except Exception as e:
+                    print(
+                        f"SUBSCRIBED: {len(keys)}"
+                    )
 
-                feed_status = "ERROR"
-                feed_error = str(e)
-
-                log(
-                    f"UPSTOX SUBSCRIPTION ERROR: {e}"
-                )
+                except Exception as e:
+                    feed_status = "ERROR"
+                    feed_message = (
+                        f"Subscribe error: {e}"
+                    )
 
         def on_message(message):
-
-            global last_tick_count_log
+            global feed_status
+            global feed_message
 
             try:
 
-                feeds = message.get("feeds", {})
+                # SDK normally provides a dict.
+                # Handle bytes/string too.
+                if isinstance(
+                    message,
+                    (bytes, bytearray)
+                ):
+                    message = json.loads(
+                        message.decode(
+                            "utf-8"
+                        )
+                    )
+
+                elif isinstance(
+                    message,
+                    str
+                ):
+                    message = json.loads(
+                        message
+                    )
+
+                if not isinstance(
+                    message,
+                    dict
+                ):
+                    return
+
+                feeds = message.get(
+                    "feeds",
+                    {}
+                )
 
                 if not feeds:
                     return
 
-                for key, feed in feeds.items():
+                feed_status = "CONNECTED"
+                feed_message = "Live ticks received"
 
-                    ltpc = feed.get("ltpc")
+                for instrument_key, item in feeds.items():
+
+                    if not isinstance(
+                        item,
+                        dict
+                    ):
+                        continue
+
+                    ltpc = item.get(
+                        "ltpc"
+                    )
+
+                    if not ltpc:
+                        # Some responses may have nested feed
+                        # data.
+                        full_feed = item.get(
+                            "ff"
+                        )
+
+                        if isinstance(
+                            full_feed,
+                            dict
+                        ):
+                            ltpc = (
+                                full_feed
+                                .get("ltpc")
+                            )
 
                     if not ltpc:
                         continue
 
-                    ltp = ltpc.get("ltp")
-                    ltq = ltpc.get("ltq", 0)
-                    ltt = ltpc.get("ltt")
+                    ltp = ltpc.get(
+                        "ltp"
+                    )
 
-                    if ltp is None:
+                    ltq = ltpc.get(
+                        "ltq",
+                        0
+                    )
+
+                    ltt = ltpc.get(
+                        "ltt"
+                    )
+
+                    if ltt is None:
                         continue
 
-                    try:
-                        price = float(ltp)
-                    except Exception:
-                        continue
+                    with state_lock:
 
-                    try:
-                        quantity = int(ltq or 0)
-                    except Exception:
-                        quantity = 0
+                        symbol = None
 
-                    try:
-                        trade_time = int(
+                        for s, key in (
+                            instrument_keys.items()
+                        ):
+                            if key == instrument_key:
+                                symbol = s
+                                break
+
+                    if symbol:
+                        process_tick(
+                            symbol,
+                            ltp,
+                            ltq,
                             ltt
-                            if ltt is not None
-                            else now_ms()
                         )
-                    except Exception:
-                        trade_time = now_ms()
-
-                    process_trade(
-                        key,
-                        price,
-                        quantity,
-                        trade_time
-                    )
-
-                # Print a heartbeat every 1000 received ticks.
-                if tick_count >= last_tick_count_log + 1000:
-
-                    last_tick_count_log = tick_count
-
-                    log(
-                        f"LIVE TICKS RECEIVED: "
-                        f"{tick_count}"
-                    )
 
             except Exception as e:
+                print(
+                    "MESSAGE ERROR:",
+                    e
+                )
 
-                log(
-                    f"UPSTOX MESSAGE ERROR: {e}"
+                feed_message = (
+                    f"Feed message error: {e}"
                 )
 
         def on_error(error):
-
             global feed_status
-            global feed_error
+            global feed_message
 
             feed_status = "ERROR"
-            feed_error = str(error)
+            feed_message = str(error)
 
-            log(
-                f"UPSTOX FEED ERROR: {error}"
+            print(
+                "FEED ERROR:",
+                error
             )
 
-        def on_close(close_code, close_message):
-
+        def on_close(*args):
             global feed_status
-            global feed_error
+            global feed_message
 
-            feed_status = "RECONNECTING"
-            feed_error = (
-                f"Code={close_code}, "
-                f"Message={close_message}"
+            feed_status = "DISCONNECTED"
+            feed_message = "Feed closed"
+
+            print(
+                "FEED CLOSED"
             )
 
-            log(
-                "UPSTOX FEED CLOSED: "
-                f"code={close_code}, "
-                f"message={close_message}"
-            )
-
-        def on_reconnecting(message):
-
-            global feed_status
-
-            feed_status = "RECONNECTING"
-
-            log(
-                f"UPSTOX RECONNECTING: {message}"
-            )
-
-        def on_reconnect_stopped(message):
-
-            global feed_status
-            global feed_error
-
-            feed_status = "ERROR"
-            feed_error = str(message)
-
-            log(
-                f"UPSTOX AUTO RECONNECT STOPPED: "
-                f"{message}"
-            )
-
-        streamer.on("open", on_open)
-        streamer.on("message", on_message)
-        streamer.on("error", on_error)
-        streamer.on("close", on_close)
-        streamer.on("reconnecting", on_reconnecting)
         streamer.on(
-            "autoReconnectStopped",
-            on_reconnect_stopped
+            "open",
+            on_open
+        )
+
+        streamer.on(
+            "message",
+            on_message
+        )
+
+        streamer.on(
+            "error",
+            on_error
+        )
+
+        streamer.on(
+            "close",
+            on_close
+        )
+
+        print(
+            "CONNECTING UPSTOX V3 FEED..."
         )
 
         streamer.auto_reconnect(
             True,
             5,
-            999999
+            10
         )
-
-        log("Calling streamer.connect()...")
 
         streamer.connect()
-
-        log(
-            "streamer.connect() returned"
-        )
 
     except Exception as e:
 
         feed_status = "ERROR"
-        feed_error = str(e)
+        feed_message = str(e)
 
-        log("")
-        log("==============================================")
-        log("LIVE FEED START ERROR")
-        log(str(e))
-        log("==============================================")
-        log("")
+        print(
+            "FEED START ERROR:",
+            e
+        )
 
 
 # =========================================================
-# SCANNER STARTUP
+# ADD SYMBOL
 # =========================================================
 
-def scanner_startup():
+def add_symbol(symbol):
+    symbol = str(
+        symbol
+    ).strip().upper()
 
+    if not symbol:
+        return False, "Symbol खाली है"
+
+    with state_lock:
+        if symbol in watchlist:
+            return False, (
+                f"{symbol} पहले से मौजूद है"
+            )
+
+    try:
+
+        item = instrument_search(
+            symbol
+        )
+
+        if not item:
+            return False, (
+                f"{symbol} NSE में नहीं मिला"
+            )
+
+        key = item.get(
+            "instrument_key"
+        )
+
+        if not key:
+            return False, (
+                f"{symbol} का instrument key नहीं मिला"
+            )
+
+        with state_lock:
+
+            watchlist.append(symbol)
+
+            instrument_keys[symbol] = key
+            valid_symbols.add(symbol)
+
+            invalid_symbols.pop(
+                symbol,
+                None
+            )
+
+        save_watchlist()
+
+        # Seed history in background
+        threading.Thread(
+            target=seed_one_symbol,
+            args=(symbol,),
+            daemon=True
+        ).start()
+
+        # Subscribe immediately if feed is connected
+        if streamer and feed_status == "CONNECTED":
+
+            try:
+                streamer.subscribe(
+                    [key],
+                    "ltpc"
+                )
+
+            except Exception as e:
+                print(
+                    f"SUBSCRIBE NEW SYMBOL ERROR "
+                    f"{symbol}: {e}"
+                )
+
+        return True, (
+            f"{symbol} successfully added"
+        )
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+# =========================================================
+# REMOVE SYMBOL
+# =========================================================
+
+def remove_symbol(symbol):
+
+    symbol = str(
+        symbol
+    ).strip().upper()
+
+    with state_lock:
+
+        if symbol not in watchlist:
+            return False, (
+                f"{symbol} watchlist में नहीं है"
+            )
+
+        key = instrument_keys.get(
+            symbol
+        )
+
+    # Unsubscribe first
+    if streamer and key:
+
+        try:
+            streamer.unsubscribe(
+                [key]
+            )
+
+        except Exception as e:
+            print(
+                f"UNSUBSCRIBE ERROR {symbol}: {e}"
+            )
+
+    with state_lock:
+
+        if symbol in watchlist:
+            watchlist.remove(symbol)
+
+        instrument_keys.pop(
+            symbol,
+            None
+        )
+
+        valid_symbols.discard(
+            symbol
+        )
+
+        invalid_symbols.pop(
+            symbol,
+            None
+        )
+
+        reset_runtime_for_symbol(
+            symbol
+        )
+
+    save_watchlist()
+
+    rebuild_signals()
+
+    return True, (
+        f"{symbol} removed"
+    )
+
+
+# =========================================================
+# SEED ONE SYMBOL
+# =========================================================
+
+def seed_one_symbol(symbol):
+
+    try:
+
+        fetch_initial_candles(
+            symbol
+        )
+
+        rebuild_signals()
+
+    except Exception as e:
+
+        print(
+            f"SEED ERROR {symbol}: {e}"
+        )
+
+
+# =========================================================
+# START SCANNER
+# =========================================================
+
+def start_scanner():
+
+    global scanner_started
     global feed_status
-    global feed_error
+    global feed_message
 
-    log("")
-    log("##############################################")
-    log("# RedVol5M LIVE NSE SCANNER")
-    log("##############################################")
-    log("")
-
-    if not ACCESS_TOKEN:
-
-        feed_status = "ERROR"
-        feed_error = (
-            "UPSTOX_ACCESS_TOKEN environment variable "
-            "is missing"
-        )
-
-        log(
-            "ERROR: UPSTOX_ACCESS_TOKEN environment "
-            "variable is missing"
-        )
-
+    if scanner_started:
         return
 
-    # -----------------------------------------------------
-    # STEP 1 - Load instruments
-    # -----------------------------------------------------
+    scanner_started = True
 
-    loaded = load_nse_equity_instruments()
+    print("========================================")
+    print("RedVol5M PERSONAL WATCHLIST SCANNER")
+    print("========================================")
 
-    if not loaded:
+    load_watchlist()
 
-        log(
-            "SCANNER STOPPED: instrument loading failed"
-        )
+    print(
+        f"WATCHLIST COUNT: {len(watchlist)}"
+    )
 
-        return
+    resolve_watchlist()
 
-    # -----------------------------------------------------
-    # STEP 2 - Start candle rotation
-    # -----------------------------------------------------
+    # Load recent completed candles
+    seed_all_symbols()
 
+    # Time rotation thread
     threading.Thread(
-        target=rotate_candles_loop,
+        target=rotate_loop,
         daemon=True
     ).start()
 
-    # -----------------------------------------------------
-    # STEP 3 - Start Upstox live feed
-    # -----------------------------------------------------
+    # Live feed thread
+    threading.Thread(
+        target=start_feed,
+        daemon=True
+    ).start()
 
-    start_live_feed()
+    feed_status = "CONNECTING"
+    feed_message = (
+        "Connecting to Upstox V3..."
+    )
 
-
-# Start scanner in background so Flask stays responsive.
-threading.Thread(
-    target=scanner_startup,
-    daemon=True
-).start()
+    print(
+        "SCANNER STARTED"
+    )
 
 
 # =========================================================
@@ -764,194 +1230,308 @@ threading.Thread(
 # =========================================================
 
 HTML = """
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1"
-    >
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
 
-    <meta
-        http-equiv="refresh"
-        content="5"
-    >
+<title>RedVol5M</title>
 
-    <title>RedVol5M</title>
+<meta http-equiv="refresh" content="2">
 
-    <style>
+<style>
 
-        body {
-            font-family: Arial, sans-serif;
-            background: #111;
-            color: #eee;
-            margin: 0;
-            padding: 15px;
-        }
+body {
+    font-family: Arial, sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+    padding: 15px;
+}
 
-        .box {
-            background: #1b1b1b;
-            border-radius: 12px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
+h1 {
+    margin-top: 0;
+}
 
-        h1 {
-            margin-top: 0;
-        }
+.card {
+    background: #1d1d1d;
+    border-radius: 12px;
+    padding: 15px;
+    margin-bottom: 15px;
+}
 
-        .live {
-            font-weight: bold;
-        }
+.ok {
+    color: #36d278;
+}
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
+.bad {
+    color: #ff5b5b;
+}
 
-        th, td {
-            padding: 10px 6px;
-            border-bottom: 1px solid #333;
-            text-align: left;
-        }
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
 
-        th {
-            background: #222;
-        }
+th, td {
+    padding: 10px 5px;
+    border-bottom: 1px solid #333;
+    text-align: left;
+}
 
-        .green {
-            color: #5cff85;
-        }
+th {
+    color: #aaa;
+}
 
-        .red {
-            color: #ff6b6b;
-        }
+input {
+    width: 65%;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #555;
+    background: #222;
+    color: white;
+    font-size: 16px;
+}
 
-        .small {
-            color: #aaa;
-            font-size: 13px;
-        }
+button {
+    padding: 11px 14px;
+    border-radius: 8px;
+    border: none;
+    background: #2f7df6;
+    color: white;
+    font-size: 15px;
+}
 
-    </style>
+.remove {
+    background: #b52b2b;
+    padding: 6px 9px;
+}
+
+.small {
+    color: #aaa;
+    font-size: 13px;
+}
+
+.signal {
+    color: #36d278;
+    font-weight: bold;
+}
+
+</style>
 </head>
 
 <body>
 
-<div class="box">
+<h1>🚀 RedVol5M</h1>
 
-    <h1>RedVol5M</h1>
+<div class="card">
 
-    <div>
-        <b>Status:</b>
-        <span class="live">
-            {{ feed_status }}
-        </span>
-    </div>
+<b>Feed:</b>
 
-    <div>
-        <b>NSE Equity:</b>
-        {{ instrument_count }}
-    </div>
+{% if feed_status == "CONNECTED" %}
+<span class="ok">CONNECTED</span>
+{% elif feed_status == "ERROR" %}
+<span class="bad">ERROR</span>
+{% else %}
+<span>{{ feed_status }}</span>
+{% endif %}
 
-    <div>
-        <b>Feed:</b>
-        {{ feed_status }}
-    </div>
+<br><br>
 
-    <div>
-        <b>Last Tick:</b>
-        {{ last_tick }}
-    </div>
+<b>Watchlist:</b>
+{{ watch_count }}
 
-    <div>
-        <b>Last Completed Candle:</b>
-        {{ last_completed }}
-    </div>
+<br>
 
-    <div>
-        <b>Ticks:</b>
-        {{ tick_count }}
-    </div>
+<b>Valid NSE:</b>
+{{ valid_count }}
 
-    {% if feed_error %}
-    <div class="red">
-        <b>Feed message:</b>
-        {{ feed_error }}
-    </div>
-    {% endif %}
+<br>
+
+<b>Invalid:</b>
+{{ invalid_count }}
+
+<br>
+
+<b>Last Tick:</b>
+{{ last_tick }}
+
+<br>
+
+<b>Last Completed Candle:</b>
+{{ last_completed }}
+
+<br>
+
+<b>Feed Message:</b>
+<span class="small">
+{{ feed_message }}
+</span>
 
 </div>
 
 
-<div class="box">
+<div class="card">
 
-    <h2>Fresh Top 10</h2>
+<h2>🔥 TOP 5</h2>
 
-    <div class="small">
-        Conditions:
-        Previous candle GREEN +
-        Current candle RED +
-        Current Volume &gt; Previous Volume +
-        Price ≥ ₹50
-    </div>
+{% if signals %}
 
-    <br>
+<table>
 
-    {% if results %}
+<tr>
+<th>#</th>
+<th>Symbol</th>
+<th>Price</th>
+<th>Volume</th>
+<th>Jump</th>
+<th>Candle</th>
+</tr>
 
-    <table>
+{% for s in signals %}
 
-        <tr>
-            <th>#</th>
-            <th>Share</th>
-            <th>Price</th>
-            <th>Volume Jump</th>
-            <th>Current Vol</th>
-            <th>Previous Vol</th>
-        </tr>
+<tr>
 
-        {% for row in results %}
+<td>{{ loop.index }}</td>
 
-        <tr>
-            <td>{{ loop.index }}</td>
+<td class="signal">
+{{ s.symbol }}
+</td>
 
-            <td>
-                <b>{{ row.symbol }}</b>
-            </td>
+<td>
+₹{{ "%.2f"|format(s.price) }}
+</td>
 
-            <td>
-                ₹{{ "%.2f"|format(row.price) }}
-            </td>
+<td>
+{{ "{:,.0f}".format(s.volume) }}
+</td>
 
-            <td class="green">
-                <b>{{ "%.2f"|format(row.volume_jump) }}x</b>
-            </td>
+<td class="signal">
++{{ "%.1f"|format(s.volume_jump) }}%
+</td>
 
-            <td>
-                {{ "{:,}".format(row.volume|int) }}
-            </td>
+<td>
+{{ s.candle_time }}
+</td>
 
-            <td>
-                {{ "{:,}".format(row.previous_volume|int) }}
-            </td>
+</tr>
 
-        </tr>
+{% endfor %}
 
-        {% endfor %}
+</table>
 
-    </table>
+{% else %}
 
-    {% else %}
+<p>
+अभी कोई शेयर आपकी सभी conditions पूरी नहीं कर रहा।
+</p>
 
-    <h3>No Signal Found</h3>
+{% endif %}
 
-    <div class="small">
-        Scanner is waiting for two completed
-        5-minute candles.
-    </div>
+</div>
 
-    {% endif %}
+
+<div class="card">
+
+<h2>➕ शेयर जोड़ें</h2>
+
+<form action="/add" method="post">
+
+<input
+    name="symbol"
+    placeholder="जैसे RELIANCE"
+    autocomplete="off">
+
+<button type="submit">
+ADD
+</button>
+
+</form>
+
+<p class="small">
+शेयर NSE Equity में होना चाहिए।
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h2>📋 आपकी Watchlist</h2>
+
+{% for symbol in watchlist %}
+
+<div style="padding:7px 0;">
+
+<b>{{ symbol }}</b>
+
+<form
+    action="/remove"
+    method="post"
+    style="display:inline;">
+
+<input
+    type="hidden"
+    name="symbol"
+    value="{{ symbol }}">
+
+<button
+    class="remove"
+    type="submit">
+REMOVE
+</button>
+
+</form>
+
+</div>
+
+{% endfor %}
+
+</div>
+
+
+{% if invalid_symbols %}
+
+<div class="card">
+
+<h3>⚠️ NSE में नहीं मिले</h3>
+
+{% for symbol, reason in invalid_symbols.items() %}
+
+<div>
+{{ symbol }} — {{ reason }}
+</div>
+
+{% endfor %}
+
+</div>
+
+{% endif %}
+
+
+<div class="card small">
+
+<b>Conditions:</b>
+
+<br>
+1. Previous completed 5-minute candle = Green
+
+<br>
+2. Latest completed 5-minute candle = Red
+
+<br>
+3. Latest Volume > Previous Volume
+
+<br>
+4. Price ≥ ₹50
+
+<br>
+5. Top 5 = Highest Volume Jump
+
+<br>
+6. केवल completed candle पर signal
 
 </div>
 
@@ -961,7 +1541,7 @@ HTML = """
 
 
 # =========================================================
-# ROUTE
+# HOME
 # =========================================================
 
 @app.route("/")
@@ -969,35 +1549,168 @@ def home():
 
     with state_lock:
 
-        page_results = list(results)
-
-        return render_template_string(
-            HTML,
-            feed_status=feed_status,
-            feed_error=feed_error,
-            instrument_count=len(instrument_keys),
-            last_tick=format_time(last_tick_time),
-            last_completed=format_bucket(
-                last_completed_bucket
-            ),
-            tick_count=tick_count,
-            results=page_results,
+        tick_values = list(
+            last_tick_time.values()
         )
+
+        if tick_values:
+
+            latest_tick = max(
+                tick_values
+            )
+
+            last_tick = (
+                latest_tick.strftime(
+                    "%H:%M:%S"
+                )
+            )
+
+        else:
+            last_tick = "Waiting"
+
+        current_signals = list(
+            signals
+        )
+
+        current_watchlist = list(
+            watchlist
+        )
+
+        current_invalid = dict(
+            invalid_symbols
+        )
+
+        current_feed_status = (
+            feed_status
+        )
+
+        current_feed_message = (
+            feed_message
+        )
+
+        current_last_completed = (
+            last_completed_candle
+        )
+
+        current_valid_count = len(
+            valid_symbols
+        )
+
+    return render_template_string(
+        HTML,
+        signals=current_signals,
+        watchlist=current_watchlist,
+        invalid_symbols=current_invalid,
+        watch_count=len(
+            current_watchlist
+        ),
+        valid_count=current_valid_count,
+        invalid_count=len(
+            current_invalid
+        ),
+        last_tick=last_tick,
+        last_completed=current_last_completed,
+        feed_status=current_feed_status,
+        feed_message=current_feed_message,
+    )
 
 
 # =========================================================
-# RUN
+# ADD ROUTE
+# =========================================================
+
+@app.route(
+    "/add",
+    methods=["POST"]
+)
+def add_route():
+
+    symbol = request.form.get(
+        "symbol",
+        ""
+    )
+
+    ok, message = add_symbol(
+        symbol
+    )
+
+    print(
+        "ADD:",
+        message
+    )
+
+    return (
+        "<script>"
+        "alert(" +
+        json.dumps(message) +
+        ");"
+        "window.location='/';"
+        "</script>"
+    )
+
+
+# =========================================================
+# REMOVE ROUTE
+# =========================================================
+
+@app.route(
+    "/remove",
+    methods=["POST"]
+)
+def remove_route():
+
+    symbol = request.form.get(
+        "symbol",
+        ""
+    )
+
+    ok, message = remove_symbol(
+        symbol
+    )
+
+    print(
+        "REMOVE:",
+        message
+    )
+
+    return (
+        "<script>"
+        "alert(" +
+        json.dumps(message) +
+        ");"
+        "window.location='/';"
+        "</script>"
+    )
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.route("/health")
+def health():
+    return "OK"
+
+
+# =========================================================
+# START
 # =========================================================
 
 if __name__ == "__main__":
 
+    threading.Thread(
+        target=start_scanner,
+        daemon=True
+    ).start()
+
     port = int(
-        os.environ.get("PORT", "10000")
+        os.getenv(
+            "PORT",
+            "10000"
+        )
     )
 
     app.run(
         host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
+        port=port
     )
