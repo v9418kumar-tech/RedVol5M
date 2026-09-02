@@ -59,25 +59,21 @@ UPSTOX_INTRADAY = (
 )
 
 state_lock = threading.RLock()
+scan_lock = threading.Lock()
 
 watchlist = list(DEFAULT_WATCHLIST)
-
 instrument_map = {}
-
 invalid_symbols = []
-
 signals = []
+diagnostics = {}
 
 last_update = None
-
 last_completed_candle = None
 
 feed_status = "STARTING"
-
 feed_message = "Starting scanner..."
 
 scanner_started = False
-
 last_scan_bucket = None
 
 
@@ -96,7 +92,6 @@ def now_ist():
 def clean_symbols(items):
 
     out = []
-
     seen = set()
 
     for item in items:
@@ -113,7 +108,6 @@ def clean_symbols(items):
             continue
 
         seen.add(symbol)
-
         out.append(symbol)
 
     return out
@@ -134,7 +128,9 @@ def load_nse_instruments():
 
     response.raise_for_status()
 
-    raw_data = gzip.decompress(response.content)
+    raw_data = gzip.decompress(
+        response.content
+    )
 
     data = json.loads(
         raw_data.decode("utf-8")
@@ -151,7 +147,6 @@ def load_nse_instruments():
             if isinstance(data.get(key), list):
 
                 data = data[key]
-
                 break
 
     if not isinstance(data, list):
@@ -192,7 +187,6 @@ def load_nse_instruments():
         )
 
     with state_lock:
-
         instrument_map = mapping
 
     return len(mapping)
@@ -217,21 +211,16 @@ def resolve_watchlist():
         )
 
     bad = []
-
     good = []
 
     for symbol in current_watchlist:
 
         if symbol in mapping:
-
             good.append(symbol)
-
         else:
-
             bad.append(symbol)
 
     with state_lock:
-
         invalid_symbols = bad
 
     return good
@@ -247,7 +236,6 @@ def completed_candles(
 ):
 
     if now is None:
-
         now = now_ist()
 
     output = []
@@ -259,7 +247,6 @@ def completed_candles(
             or
             len(candle) < 6
         ):
-
             continue
 
         try:
@@ -283,10 +270,6 @@ def completed_candles(
                     IST
                 )
 
-            # Candle timestamp is the START time.
-            # A 5-minute candle is complete only
-            # after timestamp + 5 minutes.
-
             if (
                 timestamp
                 + timedelta(minutes=5)
@@ -305,7 +288,6 @@ def completed_candles(
                 )
 
         except Exception:
-
             continue
 
     output.sort(
@@ -340,10 +322,7 @@ def fetch_symbol(
     )
 
     headers = {
-
-        "Accept":
-            "application/json",
-
+        "Accept": "application/json",
         "Authorization":
             f"Bearer {UPSTOX_TOKEN}"
     }
@@ -401,255 +380,338 @@ def fetch_symbol(
 
 
 # ---------------------------------------------------------
+# DIAGNOSTIC BUILDER
+# ---------------------------------------------------------
+
+def make_diagnostic(
+    symbol,
+    pair
+):
+
+    previous = pair[0]
+    current = pair[1]
+
+    previous_timestamp = previous[0]
+    current_timestamp = current[0]
+
+    previous_open = previous[1]
+    previous_close = previous[4]
+    previous_volume = previous[5]
+
+    current_open = current[1]
+    current_close = current[4]
+    current_volume = current[5]
+
+    prev_green = (
+        previous_close > previous_open
+    )
+
+    cur_red = (
+        current_close < current_open
+    )
+
+    volume_higher = (
+        current_volume > previous_volume
+    )
+
+    price_ok = (
+        current_close >= 50
+    )
+
+    signal_ok = (
+        prev_green
+        and cur_red
+        and volume_higher
+        and price_ok
+    )
+
+    if previous_volume > 0:
+
+        jump = (
+            current_volume
+            /
+            previous_volume
+        )
+
+    else:
+
+        jump = 0
+
+    return {
+
+        "symbol": symbol,
+
+        "prev_ts":
+            previous_timestamp.isoformat(),
+
+        "cur_ts":
+            current_timestamp.isoformat(),
+
+        "prev_open":
+            previous_open,
+
+        "prev_close":
+            previous_close,
+
+        "prev_vol":
+            int(previous_volume),
+
+        "cur_open":
+            current_open,
+
+        "cur_close":
+            current_close,
+
+        "cur_vol":
+            int(current_volume),
+
+        "price":
+            current_close,
+
+        "jump":
+            jump,
+
+        "prev_green":
+            prev_green,
+
+        "cur_red":
+            cur_red,
+
+        "volume_higher":
+            volume_higher,
+
+        "price_ok":
+            price_ok,
+
+        "signal":
+            signal_ok
+    }
+
+
+# ---------------------------------------------------------
 # MAIN SCAN
 # ---------------------------------------------------------
 
 def run_scan():
 
     global signals
+    global diagnostics
     global last_update
     global last_completed_candle
     global feed_status
     global feed_message
 
-    symbols = resolve_watchlist()
-
-    if not symbols:
-
-        with state_lock:
-
-            signals = []
-
-            feed_status = "ERROR"
-
-            feed_message = (
-                "No valid NSE shares in watchlist"
-            )
-
-            last_update = now_ist()
-
+    # Prevent two scans from overwriting each other
+    if not scan_lock.acquire(
+        blocking=False
+    ):
         return
 
-    results = []
+    try:
 
-    errors = []
+        symbols = resolve_watchlist()
 
-    with ThreadPoolExecutor(
-        max_workers=min(
-            12,
-            len(symbols)
-        )
-    ) as executor:
+        if not symbols:
 
-        futures = {}
+            with state_lock:
 
-        with state_lock:
+                signals = []
+                diagnostics = {}
 
-            mapping = dict(
-                instrument_map
+                feed_status = "ERROR"
+
+                feed_message = (
+                    "No valid NSE shares in watchlist"
+                )
+
+                last_update = now_ist()
+
+            return
+
+        results = []
+        errors = []
+
+        with ThreadPoolExecutor(
+            max_workers=min(
+                12,
+                len(symbols)
             )
+        ) as executor:
 
-        for symbol in symbols:
+            futures = {}
 
-            if symbol not in mapping:
+            with state_lock:
 
-                continue
-
-            futures[
-                executor.submit(
-                    fetch_symbol,
-                    symbol,
-                    mapping[symbol]
-                )
-            ] = symbol
-
-        for future in as_completed(
-            futures
-        ):
-
-            try:
-
-                symbol, candles, error = (
-                    future.result()
+                mapping = dict(
+                    instrument_map
                 )
 
-            except Exception as error:
+            for symbol in symbols:
 
-                symbol = futures[future]
+                if symbol not in mapping:
+                    continue
 
-                candles = None
-
-                error = str(error)
-
-            if error:
-
-                errors.append(
-                    f"{symbol}: {error}"
-                )
-
-                continue
-
-            if candles:
-
-                results.append(
-                    (
+                futures[
+                    executor.submit(
+                        fetch_symbol,
                         symbol,
-                        candles
+                        mapping[symbol]
                     )
-                )
+                ] = symbol
 
-    new_signals = []
+            for future in as_completed(
+                futures
+            ):
 
-    latest_completed = None
+                try:
 
-    for symbol, pair in results:
+                    symbol, candles, error = (
+                        future.result()
+                    )
 
-        previous = pair[0]
+                except Exception as error:
 
-        current = pair[1]
+                    symbol = futures[future]
+                    candles = None
+                    error = str(error)
 
-        previous_timestamp = previous[0]
+                if error:
 
-        current_timestamp = current[0]
+                    errors.append(
+                        f"{symbol}: {error}"
+                    )
 
-        if latest_completed is None:
+                    continue
 
-            latest_completed = max(
-                previous_timestamp,
-                current_timestamp
+                if candles:
+
+                    results.append(
+                        (
+                            symbol,
+                            candles
+                        )
+                    )
+
+        new_signals = []
+        new_diagnostics = {}
+
+        latest_completed = None
+
+        for symbol, pair in results:
+
+            diagnostic = make_diagnostic(
+                symbol,
+                pair
             )
 
-        else:
+            new_diagnostics[
+                symbol
+            ] = diagnostic
 
-            latest_completed = max(
-                latest_completed,
-                previous_timestamp,
-                current_timestamp
-            )
+            previous_timestamp = pair[0][0]
+            current_timestamp = pair[1][0]
 
-        previous_open = previous[1]
+            if latest_completed is None:
 
-        previous_close = previous[4]
-
-        previous_volume = previous[5]
-
-        current_open = current[1]
-
-        current_close = current[4]
-
-        current_volume = current[5]
-
-        # -------------------------------------------------
-        # SIGNAL CONDITIONS
-        #
-        # Previous 5M = GREEN
-        # Current completed 5M = RED
-        # Current volume > Previous volume
-        # Price >= ₹50
-        # -------------------------------------------------
-
-        if (
-            previous_close > previous_open
-            and
-            current_close < current_open
-            and
-            current_volume > previous_volume
-            and
-            current_close >= 50
-        ):
-
-            if previous_volume:
-
-                volume_jump = (
-                    current_volume
-                    /
-                    previous_volume
+                latest_completed = max(
+                    previous_timestamp,
+                    current_timestamp
                 )
 
             else:
 
-                volume_jump = 0
+                latest_completed = max(
+                    latest_completed,
+                    previous_timestamp,
+                    current_timestamp
+                )
 
-            new_signals.append({
+            if diagnostic["signal"]:
 
-                "symbol":
-                    symbol,
+                new_signals.append({
 
-                "price":
-                    current_close,
+                    "symbol":
+                        symbol,
 
-                "jump":
-                    volume_jump,
+                    "price":
+                        diagnostic["price"],
 
-                "prev_vol":
-                    int(previous_volume),
+                    "jump":
+                        diagnostic["jump"],
 
-                "cur_vol":
-                    int(current_volume),
+                    "prev_vol":
+                        diagnostic["prev_vol"],
 
-                "prev_open":
-                    previous_open,
+                    "cur_vol":
+                        diagnostic["cur_vol"],
 
-                "prev_close":
-                    previous_close,
+                    "prev_open":
+                        diagnostic["prev_open"],
 
-                "cur_open":
-                    current_open,
+                    "prev_close":
+                        diagnostic["prev_close"],
 
-                "cur_close":
-                    current_close,
+                    "cur_open":
+                        diagnostic["cur_open"],
 
-                "prev_ts":
-                    previous[0].isoformat(),
+                    "cur_close":
+                        diagnostic["cur_close"],
 
-                "cur_ts":
-                    current[0].isoformat()
-            })
+                    "prev_ts":
+                        diagnostic["prev_ts"],
 
-    # Highest volume jump first
+                    "cur_ts":
+                        diagnostic["cur_ts"]
+                })
 
-    new_signals.sort(
-        key=lambda x: x["jump"],
-        reverse=True
-    )
-
-    with state_lock:
-
-        signals = new_signals[:5]
-
-        last_update = now_ist()
-
-        last_completed_candle = (
-            latest_completed
+        new_signals.sort(
+            key=lambda x: x["jump"],
+            reverse=True
         )
 
-        if (
-            errors
-            and
-            len(errors) == len(symbols)
-        ):
+        with state_lock:
 
-            feed_status = "ERROR"
+            signals = new_signals[:5]
 
-            feed_message = errors[0]
+            diagnostics = new_diagnostics
 
-        elif errors:
+            last_update = now_ist()
 
-            feed_status = "ACTIVE"
-
-            feed_message = (
-                f"Scan OK; "
-                f"{len(errors)} share(s) "
-                f"had data errors"
+            last_completed_candle = (
+                latest_completed
             )
 
-        else:
+            if (
+                errors
+                and
+                len(errors) == len(symbols)
+            ):
 
-            feed_status = "ACTIVE"
+                feed_status = "ERROR"
 
-            feed_message = (
-                "5-minute candle scan active"
-            )
+                feed_message = errors[0]
+
+            elif errors:
+
+                feed_status = "ACTIVE"
+
+                feed_message = (
+                    f"Scan OK; "
+                    f"{len(errors)} share(s) "
+                    f"had data errors"
+                )
+
+            else:
+
+                feed_status = "ACTIVE"
+
+                feed_message = (
+                    "5-minute candle scan active"
+                )
+
+    finally:
+
+        scan_lock.release()
 
 
 # ---------------------------------------------------------
@@ -664,12 +726,6 @@ def scanner_loop():
     try:
 
         total = load_nse_instruments()
-
-        with state_lock:
-
-            feed_status_text = (
-                f"NSE instruments loaded: {total}"
-            )
 
         print(
             f"Loaded {total} NSE EQ instruments"
@@ -690,9 +746,6 @@ def scanner_loop():
             "NSE instrument file error:",
             error
         )
-
-    # First scan immediately.
-    # This also works when market is closed.
 
     try:
 
@@ -747,9 +800,6 @@ def scanner_loop():
                 )
             )
 
-            # Run immediately after each
-            # completed 5-minute candle.
-
             if (
                 market_open
                 and
@@ -788,7 +838,6 @@ def get_cookie_watchlist():
     )
 
     if not raw:
-
         return None
 
     try:
@@ -849,6 +898,9 @@ def home():
             "signals":
                 list(signals),
 
+            "diagnostics":
+                dict(diagnostics),
+
             "last_update":
                 last_update,
 
@@ -890,6 +942,9 @@ def status():
             "signals":
                 list(signals),
 
+            "diagnostics":
+                dict(diagnostics),
+
             "last_update":
                 (
                     last_update.strftime(
@@ -927,8 +982,6 @@ def status():
 def add():
 
     global watchlist
-    global signals
-    global last_update
     global feed_status
     global feed_message
 
@@ -1019,10 +1072,6 @@ def add():
 
         return response
 
-    # -----------------------------------------------------
-    # ADD NEW SHARE
-    # -----------------------------------------------------
-
     current_list.append(symbol)
 
     current_list = clean_symbols(
@@ -1037,21 +1086,13 @@ def add():
 
         feed_message = (
             f"{symbol} added. "
-            f"Immediate scan running..."
+            f"Fresh scan running..."
         )
 
-    # -----------------------------------------------------
-    # IMPORTANT CHANGE:
-    #
-    # ADD ke baad scan ab background mein
-    # start nahi hoga.
-    #
-    # Pehle scan COMPLETE hoga,
-    # phir ADD response browser ko milega.
-    #
-    # Isse market band hone ke baad bhi
-    # latest completed candles turant check hongi.
-    # -----------------------------------------------------
+    # IMPORTANT:
+    # Scan is completed BEFORE response.
+    # This guarantees that the newly added
+    # share is included in this scan.
 
     try:
 
@@ -1059,7 +1100,7 @@ def add():
 
         message = (
             f"{symbol} add ho gaya aur "
-            f"turant scan bhi ho gaya."
+            f"turant fresh scan bhi ho gaya."
         )
 
     except Exception as error:
@@ -1074,6 +1115,98 @@ def add():
 
         message = (
             f"{symbol} add ho gaya, "
+            f"lekin scan mein error aaya."
+        )
+
+    with state_lock:
+
+        current_signals = list(
+            signals
+        )
+
+    response = make_response(
+        jsonify({
+
+            "ok": True,
+
+            "message":
+                message,
+
+            "watchlist":
+                current_list,
+
+            "signals":
+                current_signals
+        })
+    )
+
+    response.set_cookie(
+        "rv5m_watchlist",
+        cookie_value(current_list),
+        max_age=31536000,
+        samesite="Lax"
+    )
+
+    return response
+
+
+# ---------------------------------------------------------
+# REMOVE SHARE
+# ---------------------------------------------------------
+
+@app.route(
+    "/remove",
+    methods=["POST"]
+)
+def remove():
+
+    global watchlist
+    global feed_status
+    global feed_message
+
+    symbol = (
+        request.form
+        .get("symbol", "")
+        .strip()
+        .upper()
+    )
+
+    with state_lock:
+
+        current_list = [
+            item
+            for item in watchlist
+            if item != symbol
+        ]
+
+        watchlist = current_list
+
+        feed_status = "ACTIVE"
+
+        feed_message = (
+            f"{symbol} removed. "
+            f"Fresh scan running..."
+        )
+
+    try:
+
+        run_scan()
+
+        message = (
+            f"{symbol} hata diya gaya "
+            f"aur fresh scan bhi ho gaya."
+        )
+
+    except Exception as error:
+
+        feed_status = "ERROR"
+
+        feed_message = (
+            f"Scan error: {error}"
+        )
+
+        message = (
+            f"{symbol} hata diya gaya, "
             f"lekin scan mein error aaya."
         )
 
@@ -1099,65 +1232,6 @@ def add():
         max_age=31536000,
         samesite="Lax"
     )
-
-    return response
-
-
-# ---------------------------------------------------------
-# REMOVE SHARE
-# ---------------------------------------------------------
-
-@app.route(
-    "/remove",
-    methods=["POST"]
-)
-def remove():
-
-    global watchlist
-
-    symbol = (
-        request.form
-        .get("symbol", "")
-        .strip()
-        .upper()
-    )
-
-    with state_lock:
-
-        current_list = [
-            item
-            for item in watchlist
-            if item != symbol
-        ]
-
-        watchlist = current_list
-
-    response = make_response(
-        jsonify({
-
-            "ok": True,
-
-            "message":
-                f"{symbol} hata diya gaya.",
-
-            "watchlist":
-                current_list
-        })
-    )
-
-    response.set_cookie(
-        "rv5m_watchlist",
-        cookie_value(current_list),
-        max_age=31536000,
-        samesite="Lax"
-    )
-
-    # REMOVE ke baad bhi fresh scan
-
-    threading.Thread(
-        target=run_scan,
-        daemon=True
-    ).start()
 
     return response
 
@@ -1192,7 +1266,7 @@ body{
 }
 
 .wrap{
-    max-width:760px;
+    max-width:900px;
     margin:auto;
     padding:16px;
 }
@@ -1255,6 +1329,11 @@ th{
     font-weight:bold;
 }
 
+.bad{
+    color:red;
+    font-weight:bold;
+}
+
 input{
     font-size:20px;
     padding:13px;
@@ -1295,6 +1374,24 @@ button{
     word-break:break-word;
 }
 
+.details{
+    overflow-x:auto;
+}
+
+.details table{
+    min-width:900px;
+}
+
+.pass{
+    color:green;
+    font-weight:bold;
+}
+
+.fail{
+    color:red;
+    font-weight:bold;
+}
+
 </style>
 
 </head>
@@ -1325,7 +1422,6 @@ else 'error' }}"
 
 </div>
 
-
 <div class="stat">
 
 Watchlist:
@@ -1335,7 +1431,6 @@ Watchlist:
 </b>
 
 </div>
-
 
 <div class="stat">
 
@@ -1347,7 +1442,6 @@ Valid NSE:
 
 </div>
 
-
 <div class="stat">
 
 Invalid:
@@ -1357,7 +1451,6 @@ Invalid:
 </b>
 
 </div>
-
 
 <div class="stat">
 
@@ -1373,7 +1466,6 @@ Last Update:
 
 </div>
 
-
 <div class="stat">
 
 Last Completed Candle:
@@ -1388,7 +1480,6 @@ else "Waiting for candles" }}
 </b>
 
 </div>
-
 
 <div
 class="small"
@@ -1408,20 +1499,14 @@ id="feedmsg"
 
 <div class="small">
 
-Conditions:
-
 Previous 5M Green +
-
 Current Completed 5M Red +
-
 Current Volume &gt; Previous Volume +
-
 Price ≥ ₹50
 
 </div>
 
 <br>
-
 
 <table>
 
@@ -1430,42 +1515,28 @@ Price ≥ ₹50
 <tr>
 
 <th>#</th>
-
 <th>Share</th>
-
 <th>Price</th>
-
 <th>Vol Jump</th>
-
 <th>Previous Vol</th>
-
 <th>Current Vol</th>
-
 <th>Candle</th>
 
 </tr>
 
 </thead>
 
-
 <tbody id="signals">
-
 
 {% for s in signals %}
 
 <tr>
 
-<td>
-{{ loop.index }}
-</td>
+<td>{{ loop.index }}</td>
 
-<td>
-<b>{{ s.symbol }}</b>
-</td>
+<td><b>{{ s.symbol }}</b></td>
 
-<td>
-₹{{ "%.2f"|format(s.price) }}
-</td>
+<td>₹{{ "%.2f"|format(s.price) }}</td>
 
 <td class="green">
 {{ "%.2f"|format(s.jump) }}x
@@ -1485,8 +1556,6 @@ Price ≥ ₹50
 GREEN
 </span>
 
-<br>
-
 →
 
 <span class="red">
@@ -1500,15 +1569,12 @@ RED
 {% else %}
 
 <tr>
-
 <td colspan="7">
 No signal right now
 </td>
-
 </tr>
 
 {% endfor %}
-
 
 </tbody>
 
@@ -1519,10 +1585,59 @@ No signal right now
 
 <div class="card">
 
+<h2>🔎 Scan Details</h2>
+
+<div class="small">
+
+यहाँ scanner की exact जांच दिखाई जाएगी।
+अगर कोई share Top 5 में नहीं आया,
+तो यहाँ पता चलेगा कि कौन-सी condition fail हुई।
+
+</div>
+
+<br>
+
+<div class="details">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>Share</th>
+<th>Previous</th>
+<th>Current</th>
+<th>Volume</th>
+<th>Price</th>
+<th>Signal</th>
+
+</tr>
+
+</thead>
+
+<tbody id="diagnostics">
+
+<tr>
+<td colspan="6">
+Waiting for scan...
+</td>
+</tr>
+
+</tbody>
+
+</table>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
 <h2>
 Watchlist में Share जोड़ें
 </h2>
-
 
 <form id="addForm">
 
@@ -1544,7 +1659,6 @@ ADD
 
 </form>
 
-
 <div id="msg"></div>
 
 </div>
@@ -1555,7 +1669,6 @@ ADD
 <h2>
 Watchlist से Share हटाएँ
 </h2>
-
 
 <form id="removeForm">
 
@@ -1624,13 +1737,133 @@ Invalid Shares
 <script>
 
 
+function checkMark(value){
+
+    if(value){
+
+        return '<span class="pass">PASS ✓</span>';
+
+    }
+
+    return '<span class="fail">FAIL ✗</span>';
+
+}
+
+
+function renderDiagnostics(data){
+
+    const tbody =
+        document.getElementById(
+            'diagnostics'
+        );
+
+    tbody.innerHTML = '';
+
+    const diagnostics =
+        data.diagnostics || {};
+
+    const symbols =
+        data.watchlist || [];
+
+    if(!symbols.length){
+
+        tbody.innerHTML =
+            '<tr>' +
+            '<td colspan="6">' +
+            'Watchlist empty' +
+            '</td>' +
+            '</tr>';
+
+        return;
+    }
+
+    symbols.forEach(function(symbol){
+
+        const d =
+            diagnostics[symbol];
+
+        if(!d){
+
+            tbody.innerHTML +=
+                '<tr>' +
+                '<td><b>' +
+                symbol +
+                '</b></td>' +
+                '<td colspan="5">' +
+                '<span class="fail">' +
+                'DATA NOT AVAILABLE' +
+                '</span>' +
+                '</td>' +
+                '</tr>';
+
+            return;
+        }
+
+        tbody.innerHTML +=
+
+            '<tr>' +
+
+            '<td><b>' +
+            symbol +
+            '</b></td>' +
+
+            '<td>' +
+            'Green: ' +
+            checkMark(d.prev_green) +
+            '<br>' +
+            Number(d.prev_close).toFixed(2) +
+            ' / ' +
+            Number(d.prev_vol).toLocaleString('en-IN') +
+            '</td>' +
+
+            '<td>' +
+            'Red: ' +
+            checkMark(d.cur_red) +
+            '<br>' +
+            Number(d.cur_close).toFixed(2) +
+            ' / ' +
+            Number(d.cur_vol).toLocaleString('en-IN') +
+            '</td>' +
+
+            '<td>' +
+            'Higher: ' +
+            checkMark(d.volume_higher) +
+            '<br>' +
+            Number(d.jump).toFixed(2) +
+            'x' +
+            '</td>' +
+
+            '<td>' +
+            '≥ ₹50: ' +
+            checkMark(d.price_ok) +
+            '<br>₹' +
+            Number(d.price).toFixed(2) +
+            '</td>' +
+
+            '<td>' +
+            (
+                d.signal
+                ?
+                '<span class="pass">SIGNAL ✓</span>'
+                :
+                '<span class="fail">NO SIGNAL ✗</span>'
+            ) +
+
+            '</td>' +
+
+            '</tr>';
+
+    });
+
+}
+
+
 function render(data){
 
     document.getElementById(
         'count'
     ).textContent =
         data.watchlist.length;
-
 
     document.getElementById(
         'valid'
@@ -1639,12 +1872,10 @@ function render(data){
         -
         data.invalid.length;
 
-
     document.getElementById(
         'invalid'
     ).textContent =
         data.invalid.length;
-
 
     document.getElementById(
         'last_update'
@@ -1652,29 +1883,24 @@ function render(data){
         data.last_update ||
         'Waiting';
 
-
     document.getElementById(
         'last_completed'
     ).textContent =
         data.last_completed ||
         'Waiting for candles';
 
-
     document.getElementById(
         'feedmsg'
     ).textContent =
         data.feed_message || '';
-
 
     const feed =
         document.getElementById(
             'feed'
         );
 
-
     feed.textContent =
         data.feed_status;
-
 
     feed.className =
         (
@@ -1685,21 +1911,17 @@ function render(data){
         :
         'error';
 
-
     document.getElementById(
         'watchlist'
     ).textContent =
         data.watchlist.join(', ');
-
 
     const tbody =
         document.getElementById(
             'signals'
         );
 
-
     tbody.innerHTML = '';
-
 
     if(
         !data.signals ||
@@ -1717,7 +1939,7 @@ function render(data){
     else{
 
         data.signals.forEach(
-            (s,i)=>{
+            function(s,i){
 
                 tbody.innerHTML +=
 
@@ -1779,6 +2001,8 @@ function render(data){
         );
 
     }
+
+    renderDiagnostics(data);
 
 }
 
@@ -1967,10 +2191,7 @@ document
 
 
 // ---------------------------------------------------------
-// IMPORTANT:
-// Page reload nahi hoga.
-// Sirf data update hoga.
-// Keyboard bana rahega.
+// NO PAGE RELOAD
 // ---------------------------------------------------------
 
 setInterval(
