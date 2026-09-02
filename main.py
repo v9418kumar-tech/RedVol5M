@@ -13,29 +13,30 @@ from flask import Flask, request, render_template_string, jsonify, redirect
 
 
 # ============================================================
-# REDVOL5M - PERSONAL WATCHLIST 5-MINUTE SCANNER
+# REDVOL5M
+# PERSONAL WATCHLIST 5-MINUTE SCANNER
 # ============================================================
 
 app = Flask(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
-UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 
-INSTRUMENT_FILE_URL = (
+WATCHLIST_FILE = "watchlist.json"
+
+NSE_FILE_URL = (
     "https://assets.upstox.com/market-quote/"
     "instruments/exchange/NSE.json.gz"
 )
 
-UPSTOX_INTRADAY_URL = (
+INTRADAY_URL = (
     "https://api.upstox.com/v3/historical-candle/intraday/"
 )
 
-WATCHLIST_FILE = "watchlist.json"
-
 
 # ============================================================
-# DEFAULT WATCHLIST
+# DEFAULT 27 SHARES
 # ============================================================
 
 DEFAULT_WATCHLIST = [
@@ -74,14 +75,14 @@ DEFAULT_WATCHLIST = [
 # ============================================================
 
 state = {
-    "feed_status": "STARTING",
-    "feed_message": "Starting scanner...",
-    "last_update": None,
-    "last_completed_candle": None,
-    "signals": [],
+    "watchlist": [],
     "valid_symbols": [],
     "invalid_symbols": [],
-    "watchlist": [],
+    "signals": [],
+    "feed_status": "STARTING",
+    "feed_message": "Scanner starting...",
+    "last_update": None,
+    "last_completed_candle": None,
     "scan_running": False,
 }
 
@@ -89,8 +90,25 @@ lock = threading.Lock()
 
 
 # ============================================================
-# WATCHLIST FUNCTIONS
+# WATCHLIST
 # ============================================================
+
+def clean_watchlist(items):
+
+    result = []
+
+    for item in items:
+
+        symbol = str(item).strip().upper()
+
+        if (
+            symbol
+            and symbol not in result
+        ):
+            result.append(symbol)
+
+    return result
+
 
 def load_watchlist():
 
@@ -108,26 +126,13 @@ def load_watchlist():
 
             if isinstance(data, list):
 
-                cleaned = []
-
-                for x in data:
-
-                    symbol = (
-                        str(x)
-                        .strip()
-                        .upper()
-                    )
-
-                    if (
-                        symbol
-                        and symbol not in cleaned
-                    ):
-                        cleaned.append(symbol)
+                cleaned = clean_watchlist(data)
 
                 if cleaned:
                     return cleaned
 
     except Exception:
+
         pass
 
     return DEFAULT_WATCHLIST.copy()
@@ -135,34 +140,42 @@ def load_watchlist():
 
 def save_watchlist(items):
 
-    with open(
-        WATCHLIST_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    cleaned = clean_watchlist(items)
 
-        json.dump(
-            items,
-            f,
-            indent=2
-        )
+    try:
+
+        with open(
+            WATCHLIST_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                cleaned,
+                f,
+                indent=2
+            )
+
+    except Exception:
+
+        pass
 
 
 # ============================================================
-# OFFICIAL NSE INSTRUMENT FILE
+# NSE INSTRUMENT FILE
 # ============================================================
 
 def load_nse_instruments():
 
     response = requests.get(
-        INSTRUMENT_FILE_URL,
+        NSE_FILE_URL,
         timeout=45
     )
 
     if response.status_code != 200:
 
         raise RuntimeError(
-            "NSE instrument file HTTP "
+            "NSE file HTTP "
             + str(response.status_code)
         )
 
@@ -194,7 +207,7 @@ def load_nse_instruments():
     if not isinstance(data, list):
 
         raise RuntimeError(
-            "Unexpected NSE instrument file format"
+            "Invalid NSE instrument data"
         )
 
     mapping = {}
@@ -243,28 +256,22 @@ def load_nse_instruments():
 
 
 # ============================================================
-# TIME FUNCTIONS
+# TIME
 # ============================================================
 
-def parse_timestamp(value):
-
-    if not value:
-        return None
+def parse_time(value):
 
     try:
 
         text = str(value)
 
         if text.endswith("Z"):
-
             text = (
                 text[:-1]
                 + "+00:00"
             )
 
-        dt = datetime.fromisoformat(
-            text
-        )
+        dt = datetime.fromisoformat(text)
 
         if dt.tzinfo is None:
 
@@ -279,49 +286,43 @@ def parse_timestamp(value):
         return None
 
 
-def is_completed_5m_candle(timestamp):
+def candle_completed(timestamp):
 
-    dt = parse_timestamp(
-        timestamp
-    )
+    dt = parse_time(timestamp)
 
     if dt is None:
         return False
 
     now = datetime.now(IST)
 
-    candle_end = (
-        dt
-        + timedelta(minutes=5)
+    return (
+        dt + timedelta(minutes=5)
+        <= now
     )
-
-    return candle_end <= now
 
 
 # ============================================================
 # GET COMPLETED 5-MINUTE CANDLES
 # ============================================================
 
-def get_completed_candles(
-    instrument_key
-):
+def get_candles(instrument_key):
 
-    if not UPSTOX_ACCESS_TOKEN:
+    if not ACCESS_TOKEN:
 
         return {
             "ok": False,
             "error":
-                "UPSTOX_ACCESS_TOKEN is missing"
+                "UPSTOX_ACCESS_TOKEN missing"
         }
 
-    encoded_key = quote(
+    encoded = quote(
         instrument_key,
         safe=""
     )
 
     url = (
-        UPSTOX_INTRADAY_URL
-        + encoded_key
+        INTRADAY_URL
+        + encoded
         + "/minutes/5"
     )
 
@@ -331,7 +332,7 @@ def get_completed_candles(
 
         "Authorization":
             "Bearer "
-            + UPSTOX_ACCESS_TOKEN,
+            + ACCESS_TOKEN,
     }
 
     try:
@@ -359,22 +360,12 @@ def get_completed_candles(
                 "HTTP "
                 + str(response.status_code)
                 + ": "
-                + response.text[:300]
+                + response.text[:250]
         }
 
     try:
 
         payload = response.json()
-
-    except Exception:
-
-        return {
-            "ok": False,
-            "error":
-                "Invalid JSON response"
-        }
-
-    try:
 
         candles = (
             payload["data"]["candles"]
@@ -401,63 +392,41 @@ def get_completed_candles(
         if len(candle) < 6:
             continue
 
-        timestamp = candle[0]
-
-        if not is_completed_5m_candle(
-            timestamp
+        if not candle_completed(
+            candle[0]
         ):
             continue
 
         try:
 
-            open_price = float(
-                candle[1]
-            )
+            completed.append({
 
-            high_price = float(
-                candle[2]
-            )
+                "timestamp":
+                    candle[0],
 
-            low_price = float(
-                candle[3]
-            )
+                "open":
+                    float(candle[1]),
 
-            close_price = float(
-                candle[4]
-            )
+                "high":
+                    float(candle[2]),
 
-            volume = float(
-                candle[5]
-            )
+                "low":
+                    float(candle[3]),
+
+                "close":
+                    float(candle[4]),
+
+                "volume":
+                    float(candle[5]),
+            })
 
         except Exception:
 
             continue
 
-        completed.append({
-
-            "timestamp":
-                timestamp,
-
-            "open":
-                open_price,
-
-            "high":
-                high_price,
-
-            "low":
-                low_price,
-
-            "close":
-                close_price,
-
-            "volume":
-                volume,
-        })
-
     completed.sort(
         key=lambda x:
-        parse_timestamp(
+        parse_time(
             x["timestamp"]
         )
         or datetime.min.replace(
@@ -472,15 +441,15 @@ def get_completed_candles(
 
 
 # ============================================================
-# SCAN ONE STOCK
+# SCAN ONE SHARE
 # ============================================================
 
-def scan_symbol(
+def scan_one(
     symbol,
     instrument_key
 ):
 
-    result = get_completed_candles(
+    result = get_candles(
         instrument_key
     )
 
@@ -533,14 +502,16 @@ def scan_symbol(
         and price_ok
     )
 
-    volume_jump = 0
-
     if previous["volume"] > 0:
 
         volume_jump = (
             current["volume"]
             / previous["volume"]
         )
+
+    else:
+
+        volume_jump = 0
 
     return {
 
@@ -565,7 +536,7 @@ def scan_symbol(
 
 
 # ============================================================
-# COMPLETE SCAN
+# MAIN SCAN
 # ============================================================
 
 def perform_scan():
@@ -588,7 +559,7 @@ def perform_scan():
             )
 
         # ----------------------------------------------------
-        # LOAD OFFICIAL NSE FILE
+        # LOAD NSE SYMBOLS
         # ----------------------------------------------------
 
         try:
@@ -601,20 +572,18 @@ def perform_scan():
 
             with lock:
 
-                state["feed_status"] = (
-                    "ERROR"
-                )
+                state["feed_status"] = "ERROR"
 
                 state["feed_message"] = (
-                    "NSE instrument file error: "
+                    "NSE instrument error: "
                     + str(e)
                 )
-
-                state["signals"] = []
 
                 state["valid_symbols"] = []
 
                 state["invalid_symbols"] = []
+
+                state["signals"] = []
 
             return
 
@@ -630,19 +599,15 @@ def perform_scan():
             if key:
 
                 valid.append({
-
-                    "symbol":
-                        symbol,
-
-                    "instrument_key":
-                        key,
+                    "symbol": symbol,
+                    "instrument_key": key
                 })
 
             else:
 
                 invalid.append(
                     symbol
-                    + " — NSE equity instrument not found"
+                    + " — NSE equity not found"
                 )
 
         with lock:
@@ -657,7 +622,7 @@ def perform_scan():
             )
 
         # ----------------------------------------------------
-        # SCAN WATCHLIST
+        # SCAN
         # ----------------------------------------------------
 
         signals = []
@@ -665,34 +630,34 @@ def perform_scan():
 
         if valid:
 
+            workers = min(
+                12,
+                len(valid)
+            )
+
             with ThreadPoolExecutor(
-                max_workers=min(
-                    12,
-                    len(valid)
-                )
+                max_workers=workers
             ) as executor:
 
-                future_map = {}
+                jobs = {}
 
                 for item in valid:
 
                     future = executor.submit(
-                        scan_symbol,
+                        scan_one,
                         item["symbol"],
                         item["instrument_key"]
                     )
 
-                    future_map[future] = (
+                    jobs[future] = (
                         item["symbol"]
                     )
 
                 for future in as_completed(
-                    future_map
+                    jobs
                 ):
 
-                    symbol = future_map[
-                        future
-                    ]
+                    symbol = jobs[future]
 
                     try:
 
@@ -729,23 +694,18 @@ def perform_scan():
                         "signal"
                     ):
 
-                        current = (
-                            result["current"]
-                        )
-
                         previous = (
                             result["previous"]
+                        )
+
+                        current = (
+                            result["current"]
                         )
 
                         signals.append({
 
                             "symbol":
                                 symbol,
-
-                            "time":
-                                current[
-                                    "timestamp"
-                                ],
 
                             "price":
                                 current[
@@ -766,10 +726,15 @@ def perform_scan():
                                 result[
                                     "volume_jump"
                                 ],
+
+                            "timestamp":
+                                current[
+                                    "timestamp"
+                                ],
                         })
 
         # ----------------------------------------------------
-        # TOP 5
+        # SORT TOP 5
         # ----------------------------------------------------
 
         signals.sort(
@@ -786,19 +751,19 @@ def perform_scan():
             now.minute // 5
         ) * 5
 
-        bucket_start = now.replace(
+        current_bucket = now.replace(
             minute=minute,
             second=0,
             microsecond=0
         )
 
-        completed_start = (
-            bucket_start
+        completed_bucket = (
+            current_bucket
             - timedelta(minutes=5)
         )
 
         completed_text = (
-            completed_start.strftime(
+            completed_bucket.strftime(
                 "%d-%m-%Y %H:%M"
             )
             + " IST"
@@ -807,6 +772,17 @@ def perform_scan():
         with lock:
 
             state["signals"] = top5
+
+            state["last_update"] = (
+                now.strftime(
+                    "%d-%m-%Y %H:%M:%S"
+                )
+                + " IST"
+            )
+
+            state[
+                "last_completed_candle"
+            ] = completed_text
 
             if errors:
 
@@ -829,17 +805,6 @@ def perform_scan():
                 state["feed_message"] = (
                     "5-minute candle scan active"
                 )
-
-            state["last_update"] = (
-                now.strftime(
-                    "%d-%m-%Y %H:%M:%S"
-                )
-                + " IST"
-            )
-
-            state[
-                "last_completed_candle"
-            ] = completed_text
 
     finally:
 
@@ -866,7 +831,7 @@ def scanner_loop():
 
             now = datetime.now(IST)
 
-            bucket_start = now.replace(
+            bucket = now.replace(
                 minute=(
                     now.minute // 5
                 ) * 5,
@@ -874,21 +839,18 @@ def scanner_loop():
                 microsecond=0
             )
 
-            bucket_id = (
-                bucket_start.strftime(
-                    "%Y%m%d%H%M"
-                )
+            bucket_id = bucket.strftime(
+                "%Y%m%d%H%M"
             )
 
-            if bucket_id != last_bucket:
+            if (
+                bucket_id != last_bucket
+                and now.second >= 1
+            ):
 
-                if now.second >= 1:
+                last_bucket = bucket_id
 
-                    last_bucket = (
-                        bucket_id
-                    )
-
-                    perform_scan()
+                perform_scan()
 
             time.sleep(0.5)
 
@@ -896,23 +858,19 @@ def scanner_loop():
 
             with lock:
 
-                state["feed_status"] = (
-                    "ERROR"
-                )
+                state["feed_status"] = "ERROR"
 
-                state["feed_message"] = (
-                    str(e)
-                )
+                state["feed_message"] = str(e)
 
             time.sleep(2)
 
 
 # ============================================================
-# HTML PAGE
+# HTML
 # ============================================================
 
 HTML = """
-<!doctype html>
+<!DOCTYPE html>
 
 <html>
 
@@ -936,20 +894,20 @@ body {
 
 .box {
     background: white;
-    border-radius: 12px;
-    padding: 14px;
-    margin-bottom: 12px;
-    box-shadow: 0 1px 5px rgba(0,0,0,.10);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.10);
 }
 
 h1 {
-    margin-top: 0;
-    font-size: 25px;
+    margin: 0 0 14px 0;
+    font-size: 27px;
 }
 
 h2 {
-    font-size: 19px;
-    margin-bottom: 10px;
+    font-size: 20px;
+    margin-bottom: 12px;
 }
 
 .active {
@@ -962,43 +920,45 @@ h2 {
     font-weight: bold;
 }
 
+.small {
+    color: #555;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
 table {
     width: 100%;
     border-collapse: collapse;
-}
-
-th, td {
-    padding: 9px 5px;
-    border-bottom: 1px solid #ddd;
-    text-align: left;
-    font-size: 14px;
 }
 
 th {
     background: #eee;
 }
 
-.signal {
-    font-weight: bold;
-    font-size: 18px;
+th,
+td {
+    padding: 9px 5px;
+    border-bottom: 1px solid #ddd;
+    text-align: left;
+    font-size: 14px;
 }
 
 input {
-    padding: 9px;
-    width: 70%;
-    font-size: 16px;
+    padding: 12px;
+    width: 72%;
+    font-size: 17px;
     box-sizing: border-box;
+    border: 1px solid #aaa;
+    border-radius: 4px;
 }
 
 button {
-    padding: 9px 13px;
-    font-size: 15px;
-    margin-left: 4px;
-}
-
-.small {
-    color: #555;
-    font-size: 13px;
+    padding: 12px 15px;
+    font-size: 16px;
+    margin-left: 5px;
+    border-radius: 4px;
+    border: 1px solid #999;
+    background: #eee;
 }
 
 .green {
@@ -1011,9 +971,20 @@ button {
     font-weight: bold;
 }
 
+.signal {
+    font-weight: bold;
+    font-size: 17px;
+}
+
+#watchlist_text {
+    line-height: 1.7;
+    word-break: break-word;
+}
+
 </style>
 
 </head>
+
 
 <body>
 
@@ -1061,8 +1032,8 @@ Last Update:
 <div>
 Last Completed Candle:
 <b id="last_candle">
-{{ state.last_completed_candle or
-"Waiting for candles" }}
+{{ state.last_completed_candle
+   or "Waiting for candles" }}
 </b>
 </div>
 
@@ -1079,20 +1050,24 @@ Last Completed Candle:
 <h2>Top 5 Signals</h2>
 
 <div class="small">
+
 Conditions:
 Previous 5M Green +
 Current Completed 5M Red +
 Current Volume &gt; Previous Volume +
 Price ≥ ₹50
+
 </div>
 
 <br>
+
 
 <table>
 
 <thead>
 
 <tr>
+
 <th>#</th>
 <th>Share</th>
 <th>Price</th>
@@ -1100,25 +1075,30 @@ Price ≥ ₹50
 <th>Previous Vol</th>
 <th>Current Vol</th>
 <th>Candle</th>
+
 </tr>
 
 </thead>
+
 
 <tbody id="signals_body">
 </tbody>
 
 </table>
 
+
 <div id="no_signal"
      style="padding:12px;">
+
 अभी कोई signal नहीं मिला।
+
 </div>
 
 </div>
 
 
 <!-- ===================================================== -->
-<!-- ADD SHARE -->
+<!-- ADD -->
 <!-- ===================================================== -->
 
 <div class="box">
@@ -1126,14 +1106,17 @@ Price ≥ ₹50
 <h2>Watchlist में Share जोड़ें</h2>
 
 <form method="post"
-      action="/add">
+      action="/add"
+      autocomplete="off">
 
 <input
     type="text"
+    id="add_symbol"
     name="symbol"
     placeholder="जैसे RELIANCE"
     autocomplete="off"
     autocapitalize="characters"
+    spellcheck="false"
     required
 >
 
@@ -1147,7 +1130,7 @@ ADD
 
 
 <!-- ===================================================== -->
-<!-- REMOVE SHARE -->
+<!-- REMOVE -->
 <!-- ===================================================== -->
 
 <div class="box">
@@ -1155,7 +1138,8 @@ ADD
 <h2>Watchlist से Share हटाएँ</h2>
 
 <form method="post"
-      action="/remove">
+      action="/remove"
+      autocomplete="off">
 
 <input
     type="text"
@@ -1163,6 +1147,7 @@ ADD
     placeholder="जैसे RELIANCE"
     autocomplete="off"
     autocapitalize="characters"
+    spellcheck="false"
     required
 >
 
@@ -1187,9 +1172,7 @@ REMOVE
 
 {% for symbol in state.watchlist %}
 
-<b>{{ symbol }}</b>
-
-{% if not loop.last %}, {% endif %}
+{{ symbol }}{% if not loop.last %}, {% endif %}
 
 {% endfor %}
 
@@ -1213,12 +1196,154 @@ REMOVE
 
 
 // ==========================================================
+// IMPORTANT:
+// SAVE WATCHLIST IN MOBILE BROWSER
+// ==========================================================
+
+const WATCHLIST_KEY =
+    "redvol5m_watchlist_v2";
+
+
+// ==========================================================
+// SAVE LOCAL WATCHLIST
+// ==========================================================
+
+function saveLocalWatchlist(list) {
+
+    try {
+
+        localStorage.setItem(
+            WATCHLIST_KEY,
+            JSON.stringify(list)
+        );
+
+    } catch (e) {
+
+        console.log(
+            "Local storage error",
+            e
+        );
+
+    }
+}
+
+
+// ==========================================================
+// GET LOCAL WATCHLIST
+// ==========================================================
+
+function getLocalWatchlist() {
+
+    try {
+
+        const value =
+            localStorage.getItem(
+                WATCHLIST_KEY
+            );
+
+        if (!value) {
+            return null;
+        }
+
+        const list =
+            JSON.parse(value);
+
+        if (
+            !Array.isArray(list)
+        ) {
+            return null;
+        }
+
+        return list
+            .map(
+                x =>
+                    String(x)
+                    .trim()
+                    .toUpperCase()
+            )
+            .filter(
+                x => x.length > 0
+            );
+
+    } catch (e) {
+
+        return null;
+    }
+}
+
+
+// ==========================================================
+// SYNC MOBILE LIST TO SERVER
+// ==========================================================
+
+function syncLocalWatchlist() {
+
+    const local =
+        getLocalWatchlist();
+
+    if (
+        !local
+        || local.length === 0
+    ) {
+        return Promise.resolve();
+    }
+
+    return fetch(
+        "/sync",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+            body: JSON.stringify({
+                watchlist: local
+            })
+        }
+    )
+    .then(
+        response =>
+            response.json()
+    )
+    .then(
+        data => {
+
+            if (
+                data
+                && Array.isArray(
+                    data.watchlist
+                )
+            ) {
+
+                saveLocalWatchlist(
+                    data.watchlist
+                );
+            }
+
+        }
+    )
+    .catch(
+        error => {
+
+            console.log(
+                "Watchlist sync error:",
+                error
+            );
+
+        }
+    );
+}
+
+
+// ==========================================================
 // NUMBER FORMAT
 // ==========================================================
 
 function formatNumber(value) {
 
-    return Number(value).toLocaleString(
+    return Number(
+        value
+    ).toLocaleString(
         "en-IN",
         {
             maximumFractionDigits: 0
@@ -1228,7 +1353,7 @@ function formatNumber(value) {
 
 
 // ==========================================================
-// UPDATE SCANNER WITHOUT RELOADING PAGE
+// UPDATE PAGE WITHOUT RELOAD
 // ==========================================================
 
 function updateScanner() {
@@ -1241,7 +1366,8 @@ function updateScanner() {
     )
 
     .then(
-        response => response.json()
+        response =>
+            response.json()
     )
 
     .then(
@@ -1256,9 +1382,8 @@ function updateScanner() {
             document.getElementById(
                 "feed_status"
             ).className =
-                data.feed_status.startsWith(
-                    "ACTIVE"
-                )
+                data.feed_status
+                .startsWith("ACTIVE")
                 ? "active"
                 : "error";
 
@@ -1301,9 +1426,25 @@ function updateScanner() {
                 data.feed_message;
 
 
-            // ----------------------------------------------
-            // WATCHLIST
-            // ----------------------------------------------
+            // SAVE SERVER WATCHLIST
+            // INTO MOBILE BROWSER
+
+            if (
+                Array.isArray(
+                    data.watchlist
+                )
+            ) {
+
+                saveLocalWatchlist(
+                    data.watchlist
+                );
+
+            }
+
+
+            // ------------------------------------------------
+            // CURRENT WATCHLIST
+            // ------------------------------------------------
 
             document.getElementById(
                 "watchlist_text"
@@ -1313,9 +1454,9 @@ function updateScanner() {
                 );
 
 
-            // ----------------------------------------------
+            // ------------------------------------------------
             // TOP 5
-            // ----------------------------------------------
+            // ------------------------------------------------
 
             const body =
                 document.getElementById(
@@ -1423,9 +1564,9 @@ function updateScanner() {
             }
 
 
-            // ----------------------------------------------
-            // INVALID SHARES
-            // ----------------------------------------------
+            // ------------------------------------------------
+            // INVALID
+            // ------------------------------------------------
 
             const invalidBox =
                 document.getElementById(
@@ -1481,17 +1622,31 @@ function updateScanner() {
 
 
 // ==========================================================
-// UPDATE EVERY 2 SECONDS
-// PAGE DOES NOT RELOAD
-// KEYBOARD WILL STAY OPEN
+// START
 // ==========================================================
+
+// पहले mobile में saved list server को भेजें.
+// फिर scanner status दिखाएँ.
+
+syncLocalWatchlist()
+    .then(
+        function() {
+
+            updateScanner();
+
+        }
+    );
+
+
+// हर 2 सेकंड में केवल data update होगा.
+// पूरा page reload नहीं होगा.
+// इसलिए keyboard बंद नहीं होगा.
 
 setInterval(
     updateScanner,
     2000
 );
 
-updateScanner();
 
 </script>
 
@@ -1513,6 +1668,26 @@ def home():
 
         current_state = {
 
+            "watchlist":
+                list(
+                    state["watchlist"]
+                ),
+
+            "valid_symbols":
+                list(
+                    state["valid_symbols"]
+                ),
+
+            "invalid_symbols":
+                list(
+                    state["invalid_symbols"]
+                ),
+
+            "signals":
+                list(
+                    state["signals"]
+                ),
+
             "feed_status":
                 state["feed_status"],
 
@@ -1526,26 +1701,6 @@ def home():
                 state[
                     "last_completed_candle"
                 ],
-
-            "signals":
-                list(
-                    state["signals"]
-                ),
-
-            "valid_symbols":
-                list(
-                    state["valid_symbols"]
-                ),
-
-            "invalid_symbols":
-                list(
-                    state["invalid_symbols"]
-                ),
-
-            "watchlist":
-                list(
-                    state["watchlist"]
-                ),
         }
 
     return render_template_string(
@@ -1555,7 +1710,7 @@ def home():
 
 
 # ============================================================
-# STATUS API
+# STATUS
 # ============================================================
 
 @app.route("/api/status")
@@ -1564,6 +1719,26 @@ def api_status():
     with lock:
 
         return jsonify({
+
+            "watchlist":
+                list(
+                    state["watchlist"]
+                ),
+
+            "valid_symbols":
+                list(
+                    state["valid_symbols"]
+                ),
+
+            "invalid_symbols":
+                list(
+                    state["invalid_symbols"]
+                ),
+
+            "signals":
+                list(
+                    state["signals"]
+                ),
 
             "feed_status":
                 state["feed_status"],
@@ -1578,31 +1753,11 @@ def api_status():
                 state[
                     "last_completed_candle"
                 ],
-
-            "signals":
-                list(
-                    state["signals"]
-                ),
-
-            "valid_symbols":
-                list(
-                    state["valid_symbols"]
-                ),
-
-            "invalid_symbols":
-                list(
-                    state["invalid_symbols"]
-                ),
-
-            "watchlist":
-                list(
-                    state["watchlist"]
-                ),
         })
 
 
 # ============================================================
-# ADD SHARE
+# ADD
 # ============================================================
 
 @app.route(
@@ -1637,10 +1792,13 @@ def add_symbol():
                 watchlist
             )
 
-    # IMPORTANT:
-    # Return to main page after ADD.
-    # This fixes /add address and Back button.
+            with lock:
 
+                state["watchlist"] = (
+                    watchlist.copy()
+                )
+
+    # Main page पर वापस.
     return redirect(
         "/",
         code=303
@@ -1648,7 +1806,7 @@ def add_symbol():
 
 
 # ============================================================
-# REMOVE SHARE
+# REMOVE
 # ============================================================
 
 @app.route(
@@ -1681,13 +1839,109 @@ def remove_symbol():
             watchlist
         )
 
-    # IMPORTANT:
-    # Return to main page after REMOVE.
+        with lock:
+
+            state["watchlist"] = (
+                watchlist.copy()
+            )
 
     return redirect(
         "/",
         code=303
     )
+
+
+# ============================================================
+# MOBILE WATCHLIST SYNC
+# ============================================================
+
+@app.route(
+    "/sync",
+    methods=["POST"]
+)
+def sync_watchlist():
+
+    try:
+
+        data = request.get_json(
+            silent=True
+        )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            return jsonify({
+                "ok": False
+            }), 400
+
+        incoming = data.get(
+            "watchlist"
+        )
+
+        if not isinstance(
+            incoming,
+            list
+        ):
+            return jsonify({
+                "ok": False
+            }), 400
+
+        incoming = clean_watchlist(
+            incoming
+        )
+
+        # सुरक्षा:
+        # खाली list से server की
+        # default watchlist नहीं मिटेगी.
+
+        if not incoming:
+
+            return jsonify({
+
+                "ok": True,
+
+                "watchlist":
+                    load_watchlist()
+
+            })
+
+        save_watchlist(
+            incoming
+        )
+
+        with lock:
+
+            state["watchlist"] = (
+                incoming.copy()
+            )
+
+        # नई watchlist को तुरंत scan करें.
+
+        threading.Thread(
+            target=perform_scan,
+            daemon=True
+        ).start()
+
+        return jsonify({
+
+            "ok": True,
+
+            "watchlist":
+                incoming
+
+        })
+
+    except Exception as e:
+
+        return jsonify({
+
+            "ok": False,
+
+            "error":
+                str(e)
+
+        }), 500
 
 
 # ============================================================
@@ -1697,7 +1951,7 @@ def remove_symbol():
 @app.route("/health")
 def health():
 
-    return {
+    return jsonify({
 
         "status":
             "ok",
@@ -1708,24 +1962,23 @@ def health():
         "watchlist_count":
             len(
                 load_watchlist()
-            ),
-    }
+            )
+
+    })
 
 
 # ============================================================
-# START APPLICATION
+# START
 # ============================================================
 
 if __name__ == "__main__":
 
-    initial_watchlist = (
-        load_watchlist()
-    )
+    initial = load_watchlist()
 
     with lock:
 
         state["watchlist"] = (
-            initial_watchlist.copy()
+            initial.copy()
         )
 
     print("=" * 60)
@@ -1737,24 +1990,16 @@ if __name__ == "__main__":
     print("=" * 60)
 
     print(
-        "Watchlist: "
-        + str(
-            len(initial_watchlist)
-        )
-        + " symbols"
+        "Watchlist:",
+        len(initial)
     )
 
     print(
-        "Access token present: "
-        + str(
-            bool(
-                UPSTOX_ACCESS_TOKEN
-            )
-        )
+        "Access token present:",
+        bool(ACCESS_TOKEN)
     )
 
     print("=" * 60)
-
 
     worker = threading.Thread(
         target=scanner_loop,
@@ -1763,14 +2008,12 @@ if __name__ == "__main__":
 
     worker.start()
 
-
     port = int(
         os.environ.get(
             "PORT",
             "10000"
         )
     )
-
 
     app.run(
         host="0.0.0.0",
