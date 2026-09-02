@@ -271,6 +271,14 @@ def scan_market():
             except Exception:
 
                 continue
+                        results = temp
+
+        print(
+            "SCAN COMPLETE | SIGNALS:",
+            len(results)
+        )
+
+        time.sleep(60)
 
 
         # =========================
